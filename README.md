@@ -139,8 +139,7 @@ configuration containing one (it corrupts the whole config descriptor and
 the device stops enumerating).
 
 The verdict and a planned vendor-bulk fallback (PCM over a vendor interface + a small PC tool exposing a virtual
-microphone) are documented in `docs/RESEARCH.md` §6; a work-in-progress
-patch exists in `audio-vendor-bulk-wip.patch`.
+microphone) are documented in `docs/RESEARCH.md` §6.
 
 ### Workaround: Bluetooth audio (A2DP sink)
 
