@@ -107,6 +107,16 @@ ffplay -fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 ^
        -framedrop -rtbufsize 32M -f dshow -i video="SysDVR-UVC Capture"
 ```
 
+Note: the device may **not** appear as `SysDVR-UVC Capture` on every PC. The
+sysmodule reports a Logitech C270's USB IDs (`046D:0825`), so a machine that
+has Logitech drivers/software installed will label it with Logitech's own name
+(e.g. `Logi C270 HD WebCam`) instead of our string. Always confirm the exact
+name first and use whatever it prints:
+
+```bat
+ffmpeg -list_devices true -f dshow -i dummy
+```
+
 Note: Windows Media Foundation apps (the Camera app, browsers, Teams) do
 not support H.264 UVC cameras at all - this is a Windows limitation.
 DirectShow apps (ffplay, VLC, OBS) work.
@@ -220,6 +230,15 @@ local wireless play - that is a console-side restriction.
 - **Enumerates but no `/dev/video` (Linux)**: permissions (are you in the
   `video` group?) or a descriptor regression - `sudo dmesg` will show
   uvcvideo parse errors.
+- **Windows: `Could not find video device with name [SysDVR-UVC Capture]`
+  / dshow `I/O error`**: the device works, but Windows is listing it under a
+  different name. We advertise a real Logitech C270's USB IDs (`046D:0825`),
+  so a PC with Logitech drivers/software supplies its own friendly name (e.g.
+  `Logi C270 HD WebCam`) instead of our `iProduct` string. Run
+  `ffmpeg -list_devices true -f dshow -i dummy` and pass the exact name it
+  prints to `-i video="..."`. (A clean PC with no Logitech driver falls back
+  to the generic UVC class driver and *does* show `SysDVR-UVC Capture` - which
+  is why it varies between machines.)
 - **Black picture in OBS**: wrong node selected (the UVC *metadata* node) -
   use Device "default", Video Format H.264.
 - **Stream opens but freezes/lags**: read the Latency section; for the
