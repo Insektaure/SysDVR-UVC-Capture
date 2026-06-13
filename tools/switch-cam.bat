@@ -5,6 +5,12 @@ rem ============================================================================
 rem  SysDVR-UVC low-latency viewer (Windows)
 rem
 rem  - FFPLAY: full path to ffplay.exe if it is not in PATH
+rem  - VIDEO_DEVICE: the dshow device name. On a clean PC this is
+rem    "SysDVR-UVC Capture". On a PC with Logitech drivers/software installed,
+rem    Windows labels the device with Logitech's own name (we report a Logitech
+rem    C270's USB IDs), so the script also tries VIDEO_DEVICE_ALT. If neither
+rem    matches, the script lists the devices it can see so you can copy in the
+rem    right name.
 rem  - AUDIO_DEVICE: optional dshow audio input to play alongside the video
 rem    (e.g. the line-in/interface the Switch's headphone jack is plugged
 rem    into). Leave empty for video only. List the exact device names with:
@@ -19,31 +25,56 @@ rem ============================================================================
 
 set FFPLAY=ffplay
 set VIDEO_DEVICE=SysDVR-UVC Capture
+set VIDEO_DEVICE_ALT=Logi C270 HD WebCam
 set AUDIO_DEVICE=
 
-if defined AUDIO_DEVICE goto with_audio
+rem Try the primary name first, then the Logitech fallback.
+call :play "%VIDEO_DEVICE%"
+if not errorlevel 1 goto :eof
+
+echo.
+echo "%VIDEO_DEVICE%" not found - trying "%VIDEO_DEVICE_ALT%"...
+echo.
+call :play "%VIDEO_DEVICE_ALT%"
+if not errorlevel 1 goto :eof
+
+rem Both names failed - show what dshow actually sees and how to fix it.
+echo.
+echo Neither "%VIDEO_DEVICE%" nor "%VIDEO_DEVICE_ALT%" worked.
+echo DirectShow devices it can see:
+echo ----------------------------------------------------------------------
+ffmpeg -hide_banner -list_devices true -f dshow -i dummy 2>&1 | findstr /v /i "dummy"
+echo ----------------------------------------------------------------------
+echo Copy the exact video device name from the list above into VIDEO_DEVICE
+echo at the top of this script ^(no quotes - the script adds them^), then re-run.
+echo Other things to check:
+echo   - the Switch is plugged in with a data-capable USB cable
+echo   - ffplay.exe / ffmpeg.exe are in PATH, or set FFPLAY= at the top
+echo   - no other app is using the camera ^(OBS source active?^)
+pause
+goto :eof
+
+rem ----------------------------------------------------------------------------
+rem :play <quoted video device name>
+rem   Launches ffplay with the tuned low-latency flags. Branches on whether
+rem   AUDIO_DEVICE is set. Returns ffplay's exit code (non-zero = device not
+rem   found / failed to open; 0 = ran and was closed normally).
+rem ----------------------------------------------------------------------------
+:play
+set "DEV=%~1"
+if defined AUDIO_DEVICE goto play_av
 
 %FFPLAY% -hide_banner ^
   -fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 ^
   -framedrop -rtbufsize 32M ^
-  -f dshow -i video="%VIDEO_DEVICE%" ^
+  -f dshow -i video="%DEV%" ^
   -window_title "Nintendo Switch" -noborder -x 1280 -y 720
-goto check_error
+goto :eof
 
-:with_audio
+:play_av
 %FFPLAY% -hide_banner ^
   -fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 ^
   -framedrop -rtbufsize 32M -audio_buffer_size 50 ^
-  -f dshow -i video="%VIDEO_DEVICE%":audio="%AUDIO_DEVICE%" ^
+  -f dshow -i video="%DEV%":audio="%AUDIO_DEVICE%" ^
   -window_title "Nintendo Switch" -noborder -x 1280 -y 720
-
-:check_error
-if errorlevel 1 (
-  echo.
-  echo ffplay failed. Check that:
-  echo   - the Switch is plugged in ^(device "%VIDEO_DEVICE%" in Device Manager^)
-  echo   - ffplay.exe is in PATH, or set FFPLAY= at the top of this file
-  echo   - no other app is using the camera ^(OBS source active?^)
-  echo   - if AUDIO_DEVICE is set, the name matches ffmpeg -list_devices exactly
-  pause
-)
+goto :eof
