@@ -33,7 +33,13 @@ rem ============================================================================
 set FFPLAY=ffplay
 set VIDEO_DEVICE=SysDVR-UVC Capture
 set VIDEO_DEVICE_ALT=Logi C270 HD WebCam
+
 set AUDIO_DEVICE=
+
+rem RTBUFSIZE: dshow input buffer. SMALLER = stays more live, drops more on
+rem demanding scenes; LARGER = fewer drops but lag can pile up then drain.
+rem Tuning range ~2M-8M for live viewing (32M lets seconds of lag accumulate).
+set RTBUFSIZE=8M
 
 rem Try the primary name first, then the Logitech fallback.
 call :play "%VIDEO_DEVICE%"
@@ -73,7 +79,7 @@ if defined AUDIO_DEVICE goto play_av
 
 %FFPLAY% -hide_banner ^
   -fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 ^
-  -framedrop -rtbufsize 32M ^
+  -framedrop -rtbufsize %RTBUFSIZE% ^
   -f dshow -i video="%DEV%" ^
   -window_title "Nintendo Switch" -noborder -x 1280 -y 720
 goto :eof
@@ -81,7 +87,7 @@ goto :eof
 :play_av
 %FFPLAY% -hide_banner ^
   -fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 ^
-  -framedrop -rtbufsize 32M -audio_buffer_size 50 ^
+  -framedrop -rtbufsize %RTBUFSIZE% -audio_buffer_size 50 ^
   -f dshow -i video="%DEV%":audio="%AUDIO_DEVICE%" ^
   -window_title "Nintendo Switch" -noborder -x 1280 -y 720
 goto :eof
