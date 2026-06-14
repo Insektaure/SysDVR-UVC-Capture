@@ -104,8 +104,14 @@ OBS on Linux: add a "Video Capture Device (V4L2)" source, Device
 
 ```bat
 ffplay -fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 ^
-       -framedrop -rtbufsize 32M -f dshow -i video="SysDVR-UVC Capture"
+       -framedrop -rtbufsize 8M -f dshow -i video="SysDVR-UVC Capture"
 ```
+
+Note: `-rtbufsize` is the dshow input buffer. Keep it small (~2M-8M) for live
+viewing - a large buffer (e.g. 32M) lets several seconds of lag accumulate
+during demanding scenes that then slowly drains. Smaller drops more frames on
+heavy bursts but stays current. `tools/switch-cam.bat` exposes this as the
+`RTBUFSIZE` variable.
 
 Note: the device may **not** appear as `SysDVR-UVC Capture` on every PC. The
 sysmodule reports a Logitech C270's USB IDs (`046D:0825`), so a machine that
