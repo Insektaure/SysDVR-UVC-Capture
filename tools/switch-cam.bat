@@ -23,8 +23,11 @@ rem    -list_devices prints under the friendly name. Paste that into
 rem    AUDIO_DEVICE (it is immune to code-page mangling). The same trick works
 rem    for VIDEO_DEVICE via its "@device_pnp_..." alternative name.
 rem
-rem  The window is borderless (clean for OBS Window Capture). Move it with
-rem  Win+Arrow keys, or set an initial position by adding: -left X -top Y
+rem  - BORDER: 0 = borderless window (clean for OBS Window Capture), 1 = normal
+rem    titled/resizable window.
+rem
+rem  A borderless window has no title bar to drag - move it with Win+Arrow
+rem  keys, or set an initial position by adding: -left X -top Y
 rem
 rem  Up to ~2s of black/garbage at startup is normal (waiting for the
 rem  Switch encoder's next keyframe).
@@ -40,6 +43,12 @@ rem RTBUFSIZE: dshow input buffer. SMALLER = stays more live, drops more on
 rem demanding scenes; LARGER = fewer drops but lag can pile up then drain.
 rem Tuning range ~2M-8M for live viewing (32M lets seconds of lag accumulate).
 set RTBUFSIZE=8M
+
+rem BORDER: 0 = borderless window (clean for OBS Window Capture),
+rem         1 = normal window with a title bar and resizable borders.
+set BORDER=0
+set "BORDER_FLAG=-noborder"
+if "%BORDER%"=="1" set "BORDER_FLAG="
 
 rem Try the primary name first, then the Logitech fallback.
 call :play "%VIDEO_DEVICE%"
@@ -81,7 +90,7 @@ if defined AUDIO_DEVICE goto play_av
   -fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 ^
   -framedrop -rtbufsize %RTBUFSIZE% ^
   -f dshow -i video="%DEV%" ^
-  -window_title "Nintendo Switch" -noborder -x 1280 -y 720
+  -window_title "Nintendo Switch" %BORDER_FLAG% -x 1280 -y 720
 goto :eof
 
 :play_av
@@ -89,5 +98,5 @@ goto :eof
   -fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 ^
   -framedrop -rtbufsize %RTBUFSIZE% -audio_buffer_size 50 ^
   -f dshow -i video="%DEV%":audio="%AUDIO_DEVICE%" ^
-  -window_title "Nintendo Switch" -noborder -x 1280 -y 720
+  -window_title "Nintendo Switch" %BORDER_FLAG% -x 1280 -y 720
 goto :eof
