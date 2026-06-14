@@ -10,11 +10,18 @@ rem    "SysDVR-UVC Capture". On a PC with Logitech drivers/software installed,
 rem    Windows labels the device with Logitech's own name (we report a Logitech
 rem    C270's USB IDs), so the script also tries VIDEO_DEVICE_ALT. If neither
 rem    matches, the script lists the devices it can see so you can copy in the
-rem    right name.
+rem    right name
 rem  - AUDIO_DEVICE: optional dshow audio input to play alongside the video
 rem    (e.g. the line-in/interface the Switch's headphone jack is plugged
 rem    into). Leave empty for video only. List the exact device names with:
 rem      ffmpeg -list_devices true -f dshow -i dummy
+rem    IMPORTANT: if the device name has accented/non-ASCII characters (e.g.
+rem    a localized "Entree ligne (Realtek...)"), cmd's code page will corrupt
+rem    it and ffmpeg won't find it. In that case use the device's ASCII
+rem    "Alternative name" instead - the "@device_cm_{...}\wave_{...}" line that
+rem    -list_devices prints under the friendly name. Paste that into
+rem    AUDIO_DEVICE (it is immune to code-page mangling). The same trick works
+rem    for VIDEO_DEVICE via its "@device_pnp_..." alternative name.
 rem
 rem  The window is borderless (clean for OBS Window Capture). Move it with
 rem  Win+Arrow keys, or set an initial position by adding: -left X -top Y

@@ -189,6 +189,36 @@ so audio will trail the low-latency video slightly. While Bluetooth audio
 is active the Switch limits you to two wireless controllers and disables
 local wireless play - that is a console-side restriction.
 
+### Workaround: line-in audio (analog)
+
+Lower latency than Bluetooth: run a 3.5 mm cable from the Switch's
+headphone jack (handheld/tabletop mode only - docked, audio goes out HDMI
+and the jack is silent) into the PC's **line-in** jack, and capture it as a
+second dshow input alongside the video. The `tools/switch-cam.bat` launcher
+has an `AUDIO_DEVICE` slot for exactly this. Find the device name with:
+
+```bat
+ffmpeg -list_devices true -f dshow -i dummy
+```
+
+If the name has accented/non-ASCII characters (e.g. a localized
+`Entrée ligne (Realtek...)`), cmd's code page will corrupt it and ffmpeg
+won't find it - use the device's ASCII **Alternative name** instead (the
+`@device_cm_{...}\wave_{...}` line printed under the friendly name).
+
+> ⚠️ **Ground-loop warning.** Capturing video over USB-C *and* audio over
+> the 3.5 mm cable connects the Switch and PC by two separate grounds. The
+> resulting ground loop is heard as constant static/hum/buzz on the audio.
+> It is **not** a fault in the module, cable, or ffmpeg - it appears only
+> when both cables are connected at once. You cannot fix it by unplugging
+> USB-C (that is your video capture).
+>
+> **Mitigation:** put an inline **3.5 mm ground-loop isolator** (~€10,
+> transformer-based) on the *audio* cable. It breaks the ground path through
+> the audio shield while passing sound, leaving USB-C - and your video -
+> untouched. If you'd rather avoid extra hardware, use the Bluetooth/A2DP
+> route above instead (no shared ground, no loop).
+
 ## Technical Details
 
 - UVC 1.5, VideoControl + VideoStreaming interfaces, H.264 frame-based
