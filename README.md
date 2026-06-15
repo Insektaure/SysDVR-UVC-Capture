@@ -225,6 +225,22 @@ won't find it - use the device's ASCII **Alternative name** instead (the
 > untouched. If you'd rather avoid extra hardware, use the Bluetooth/A2DP
 > route above instead (no shared ground, no loop).
 
+**Keeping the video live with audio enabled:**
+
+When ffplay plays an audio
+stream it normally slaves the video to the audio clock, so a buffering audio
+device can drag the video behind.
+
+To avoid that, the launcher's audio path adds `-sync ext` (keep the video on the system clock; audio may drift slightly
+out of lip-sync instead) and exposes an `AUDIO_BUFFER` variable - the dshow
+audio capture buffer in milliseconds.
+
+Lower = less audio latency; the default is `20`. ffmpeg only *requests* this size and the driver picks the actual
+granularity, so going much below `~10-20` buys little and tends to cause
+crackle/dropouts - raise it to `30-50` only if the audio stutters.
+
+Note this knob affects *audio* latency, not video: for video lag, lower `RTBUFSIZE`.
+
 ## Technical Details
 
 - UVC 1.5, VideoControl + VideoStreaming interfaces, H.264 frame-based
