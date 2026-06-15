@@ -44,6 +44,12 @@ rem demanding scenes; LARGER = fewer drops but lag can pile up then drain.
 rem Tuning range ~2M-8M for live viewing (32M lets seconds of lag accumulate).
 set RTBUFSIZE=8M
 
+rem AUDIO_BUFFER: dshow audio capture buffer in milliseconds (only used when
+rem AUDIO_DEVICE is set). LOWER = less audio latency so the video isn't held
+rem back to stay in sync, but too low can cause crackle/dropouts. Raise it a
+rem little (e.g. 30-50) only if the audio stutters.
+set AUDIO_BUFFER=20
+
 rem BORDER: 0 = borderless window (clean for OBS Window Capture),
 rem         1 = normal window with a title bar and resizable borders.
 set BORDER=0
@@ -93,10 +99,14 @@ if defined AUDIO_DEVICE goto play_av
   -window_title "Nintendo Switch" %BORDER_FLAG% -x 1280 -y 720
 goto :eof
 
+rem -sync ext keeps video on the system clock instead of slaving it to the
+rem audio clock, so a slow audio device can't drag the video behind (audio may
+rem drift slightly out of lip-sync instead). -audio_buffer_size is kept low so
+rem the audio path itself adds as little latency as possible.
 :play_av
 %FFPLAY% -hide_banner ^
   -fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0 ^
-  -framedrop -rtbufsize %RTBUFSIZE% -audio_buffer_size 50 ^
+  -framedrop -sync ext -rtbufsize %RTBUFSIZE% -audio_buffer_size %AUDIO_BUFFER% ^
   -f dshow -i video="%DEV%":audio="%AUDIO_DEVICE%" ^
   -window_title "Nintendo Switch" %BORDER_FLAG% -x 1280 -y 720
 goto :eof
