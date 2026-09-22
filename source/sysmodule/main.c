@@ -46,10 +46,14 @@ static volatile bool g_running = true;
 // USB Device Configuration
 // ============================================================================
 
-// Well-known Logitech webcam VID/PID so every OS treats us as a plain
-// camera without needing custom drivers or INF matching
-#define UVC_VENDOR_ID   0x046D  // Logitech
-#define UVC_PRODUCT_ID  0x0825  // Generic Webcam
+// Our own USB identity rather than a borrowed one. Driverless operation does
+// not depend on it (UVC binding is class-based on every OS), but the IDs are
+// not harmless: macOS merges vendor-wide overrides from UVCMatching.plist, and
+// its Logitech entry (0x046D, any PID) hides the H.264 format - the only one we
+// advertise - which left earlier builds with zero formats and invisible to
+// QuickTime, OBS and AVFoundation.
+#define UVC_VENDOR_ID   0x1209  // pid.codes (open-source hardware VID)
+#define UVC_PRODUCT_ID  0xCA57  // SysDVR-UVC Capture
 
 // ============================================================================
 // Video Streaming Thread

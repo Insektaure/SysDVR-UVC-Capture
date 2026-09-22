@@ -24,7 +24,7 @@ done
 if [ -z "$DEVICE" ]; then
     echo "SysDVR-UVC capture device not found." >&2
     echo "Checks:" >&2
-    echo "  - Is the Switch plugged in? (lsusb -d 046d:0825)" >&2
+    echo "  - Is the Switch plugged in? (lsusb -d 1209:ca57)" >&2
     echo "  - Do you have access? (you must be in the 'video' group:" >&2
     echo "      sudo usermod -aG video \$USER   # then log out and back in)" >&2
     echo "  - List devices: v4l2-ctl --list-devices" >&2

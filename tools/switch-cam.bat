@@ -5,12 +5,9 @@ rem ============================================================================
 rem  SysDVR-UVC low-latency viewer (Windows)
 rem
 rem  - FFPLAY: full path to ffplay.exe if it is not in PATH
-rem  - VIDEO_DEVICE: the dshow device name. On a clean PC this is
-rem    "SysDVR-UVC Capture". On a PC with Logitech drivers/software installed,
-rem    Windows labels the device with Logitech's own name (we report a Logitech
-rem    C270's USB IDs), so the script also tries VIDEO_DEVICE_ALT. If neither
-rem    matches, the script lists the devices it can see so you can copy in the
-rem    right name
+rem  - VIDEO_DEVICE: the dshow device name, normally "SysDVR-UVC Capture".
+rem    If it does not match, the script lists the devices it can see so you
+rem    can copy in the right name
 rem  - AUDIO_DEVICE: optional dshow audio input to play alongside the video
 rem    (e.g. the line-in/interface the Switch's headphone jack is plugged
 rem    into). Leave empty for video only. List the exact device names with:
@@ -35,7 +32,6 @@ rem ============================================================================
 
 set FFPLAY=ffplay
 set VIDEO_DEVICE=SysDVR-UVC Capture
-set VIDEO_DEVICE_ALT=Logi C270 HD WebCam
 
 set AUDIO_DEVICE=
 
@@ -56,19 +52,12 @@ set BORDER=0
 set "BORDER_FLAG=-noborder"
 if "%BORDER%"=="1" set "BORDER_FLAG="
 
-rem Try the primary name first, then the Logitech fallback.
 call :play "%VIDEO_DEVICE%"
 if not errorlevel 1 goto :eof
 
+rem The name failed - show what dshow actually sees and how to fix it.
 echo.
-echo "%VIDEO_DEVICE%" not found - trying "%VIDEO_DEVICE_ALT%"...
-echo.
-call :play "%VIDEO_DEVICE_ALT%"
-if not errorlevel 1 goto :eof
-
-rem Both names failed - show what dshow actually sees and how to fix it.
-echo.
-echo Neither "%VIDEO_DEVICE%" nor "%VIDEO_DEVICE_ALT%" worked.
+echo "%VIDEO_DEVICE%" did not work.
 echo DirectShow devices it can see:
 echo ----------------------------------------------------------------------
 ffmpeg -hide_banner -list_devices true -f dshow -i dummy 2>&1 | findstr /v /i "dummy"
@@ -77,6 +66,8 @@ echo Copy the exact video device name from the list above into VIDEO_DEVICE
 echo at the top of this script ^(no quotes - the script adds them^), then re-run.
 echo Other things to check:
 echo   - the Switch is plugged in with a data-capable USB cable
+echo   - the sysmodule is recent enough ^(USB identity 1209:ca57^); older
+echo     builds reported a Logitech C270 and may be listed as "Logi C270 HD WebCam"
 echo   - ffplay.exe / ffmpeg.exe are in PATH, or set FFPLAY= at the top
 echo   - no other app is using the camera ^(OBS source active?^)
 pause
