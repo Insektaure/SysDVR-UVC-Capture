@@ -223,6 +223,55 @@ namespace ams::vitap {
 
     namespace {
 
+        /* Diagnostic (phase 2b-1): SysDVR-UVC and its donor seen from
+         * outside - their process state and thread count, logged on every
+         * change. A process that will not finish terminating keeps its pm
+         * entry (ovlSysmodules then shows it ON) and logs nothing itself. */
+        constexpr u64 SysdvrUvcProgramId = 0x00FF0000A53BB666ull;
+        constexpr u64 DonorProgramId     = 0x00FF0000A53BB668ull;
+
+        struct ProcWatch { const char *name; u64 program_id; u64 pid; s64 state; s32 threads; u32 state_rc; };
+        constinit ProcWatch g_proc_watch[2] = {
+            { "SysDVR-UVC", SysdvrUvcProgramId, 0, -1, -1, 0 },
+            { "donor",      DonorProgramId,     0, -1, -1, 0 },
+        };
+
+        const char *StateName(s64 st) {
+            static constexpr const char *Names[] = { "created", "created+attached", "running", "crashed",
+                                                     "running+attached", "TERMINATING", "terminated", "debug-break" };
+            return (st >= 0 && st < 8) ? Names[st] : "?";
+        }
+
+        void WatchProcesses() {
+            for (auto &w : g_proc_watch) {
+                os::ProcessId pid{};
+                const bool found = R_SUCCEEDED(pm::dmnt::GetProcessId(std::addressof(pid), ncm::ProgramId{w.program_id})) && pid.value != 0;
+                s64 state = -1;
+                s32 threads = -1;
+                u32 state_rc = 0;
+                if (found) {
+                    os::NativeHandle h = os::InvalidNativeHandle;
+                    ncm::ProgramLocation loc = {};
+                    cfg::OverrideStatus st = {};
+                    if (R_SUCCEEDED(pm::dmnt::AtmosphereGetProcessInfo(std::addressof(h), std::addressof(loc), std::addressof(st), pid))) {
+                        /* the kernel fills only the low 32 bits (Run: 0xFFFFFFFF00000002 = running) */
+                        if (const ::Result r = ::svcGetProcessInfo(&state, h, ProcessInfoType_ProcessState); R_FAILED(r)) { state = -1; state_rc = r; }
+                        else { state &= 0xFFFFFFFF; }
+                        u64 ids[64];
+                        if (R_FAILED(::svcGetThreadList(&threads, ids, 64, h))) { threads = -1; }
+                        os::CloseNativeHandle(h);
+                    }
+                }
+                const u64 p = found ? pid.value : 0;
+                if (p != w.pid || state != w.state || threads != w.threads) {
+                    if (p == 0) { LogLine("watch: %s gone (was pid %llu)", w.name, static_cast<unsigned long long>(w.pid)); }
+                    else { LogLine("watch: %s pid %llu %s (state %lld, rc 0x%x), %d thread(s)", w.name, static_cast<unsigned long long>(p),
+                                   StateName(state), static_cast<long long>(state), state_rc, threads); }
+                    w.pid = p; w.state = state; w.threads = threads; w.state_rc = state_rc;
+                }
+            }
+        }
+
         alignas(os::ThreadStackAlignment) constinit u8 g_watch_stack[8_KB];
         constinit os::ThreadType g_watch_thread;
 
@@ -270,6 +319,7 @@ namespace ams::vitap {
                     last_presents = presents;
                     last_log_ms = ms;
                 }
+                WatchProcesses();
                 os::SleepThread(TimeSpan::FromMilliSeconds(100));
             }
         }

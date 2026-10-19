@@ -58,6 +58,8 @@ static bool g_sdMounted = false;
 
 static void _initFileLogging(void)
 {
+    if (g_sdMounted)
+        return;
     if (R_SUCCEEDED(fsOpenSdCardFileSystem(&g_sdCard))) {
         g_sdMounted = true;
         // Keep the previous start's log (a toggle in ovlSysmodules is a
@@ -188,6 +190,19 @@ void CoreExit(void)
 #endif
 
     g_coreInitialized = false;
+}
+
+void CoreEarlyLog(void)
+{
+#if FILE_LOGGING
+    if (R_SUCCEEDED(fsInitialize()))
+        _initFileLogging();
+#endif
+    u64 pid = 0;
+    svcGetProcessId(&pid, CUR_PROCESS_HANDLE);
+    LOG("[%lus] process %lu started, waiting 20 s before init\n",
+        armTicksToNs(armGetSystemTick()) / 1000000000ULL, pid);
+    (void)pid;
 }
 
 bool CoreHasService(const char* name)

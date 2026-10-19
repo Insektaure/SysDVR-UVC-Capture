@@ -17,6 +17,7 @@
 #include "../tap_client.h"
 #include "game_dbg.h"
 #include "slotmatch.h"
+#include "donor.h"
 #include "native_probe.h"
 
 #ifdef NATIVE_PROBE
@@ -33,6 +34,7 @@
 #define MAX_BUF_BYTES     (16u * 1024 * 1024)
 #define CHUNK             0x20000      // reads go through this; dumps are written from it piece by piece
 #define DUMP_DIR          "/config/sysdvr-uvc/dump"
+#define DONOR_MB          16           // phase 2b-1: borrowed per game session, only checked (2b-3: VIC buffers)
 
 extern volatile bool g_nativeProbeRunning;
 
@@ -66,6 +68,12 @@ typedef struct {
     u64    ivNsSum, ivNsMax;
     u64    dumpedSeq;        // the present last dumped: one dump per pause
     u64    sampleNsMax;
+
+    // memory from the donor (phase 2b)
+    void*  mem;
+    u64    memSize;
+    bool   memYielded;       // given back to an applet: not taken again this session
+    u64    nextYieldCheck;
 } Session;
 
 static Session g_s;
@@ -240,6 +248,24 @@ static void _logMatch(Session* s, const char* what)
 // Session
 // ============================================================================
 
+// Borrow the donor's memory and prove it usable: a pattern on every 64 KB,
+// read back. 2b-3 puts the VIC buffers here.
+static void _takeMemory(Session* s)
+{
+    if (s->memYielded || !DonorObtain(DONOR_MB, &s->mem, &s->memSize)) {
+        s->mem = NULL;
+        return;
+    }
+    u8* m = (u8*)s->mem;
+    u32 bad = 0;
+    for (u64 off = 0; off + 8 <= s->memSize; off += 0x10000)
+        *(volatile u64*)(m + off) = off ^ 0x5A5A5A5A5A5A5A5AULL;
+    for (u64 off = 0; off + 8 <= s->memSize; off += 0x10000)
+        bad += *(volatile u64*)(m + off) != (off ^ 0x5A5A5A5A5A5A5A5AULL);
+    LOG("native: donor memory %lu MB %s\n", s->memSize >> 20, bad ? "CORRUPT" : "checked (read/write)");
+    s->nextYieldCheck = _nowNs() + 1000000000ULL;
+}
+
 static void _endSession(Session* s, const char* why)
 {
     if (!s->attached)
@@ -253,6 +279,10 @@ static void _endSession(Session* s, const char* why)
         ps.events, ps.created, ps.exited, ps.faults, ps.continues,
         ps.per_core[0], ps.per_core[1], ps.per_core[2], ps.per_core[3],
         ps.busy, ps.failed, ps.last_fail_rc, ps.max_hold_ns / 1000);
+    if (s->mem) {
+        DonorRelease();
+        s->mem = NULL;
+    }
     GameDbgDetach(&s->dbg);
     memset(s, 0, sizeof(*s));
 }
@@ -329,6 +359,7 @@ static bool _startSession(Session* s, const UvcTapPresent* p, const UvcTapSurfac
         }
     }
     s->nextRead = _nowNs() + READ_EVERY_NS;
+    _takeMemory(s);
     return true;
 }
 
@@ -457,7 +488,8 @@ static void _logPeriodic(Session* s, const UvcTapPresent* p)
 void NativeProbeThread(void* arg)
 {
     (void)arg;
-    LOG("native: probe started (phase 2a: attach, find slots, read, dump)\n");
+    LOG("native: probe started (phase 2b-1: attach, find slots, read, dump, donor memory)\n");
+    DonorCleanupStale();
     Session* s = &g_s;
     memset(s, 0, sizeof(*s));
     u64 lastLog = _nowNs();
@@ -531,6 +563,16 @@ void NativeProbeThread(void* arg)
             armTicksToNs(armGetSystemTick() - p.tick) >= PAUSED_NS) {
             s->dumpedSeq = p.seq;
             _dump(s, &p);
+        }
+
+        if (s->mem && _nowNs() >= s->nextYieldCheck) {
+            s->nextYieldCheck = _nowNs() + 1000000000ULL;
+            if (DonorShouldYield()) {
+                LOG("native: an applet needs the Applet pool - giving the donor memory back\n");
+                DonorRelease();
+                s->mem = NULL;
+                s->memYielded = true;
+            }
         }
 
         if (s->attached && _nowNs() - lastLog >= 10000000000ULL) {

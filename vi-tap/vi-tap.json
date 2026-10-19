@@ -86,7 +86,9 @@
                 "svcReplyAndReceiveWithUserBuffer": "0x44",
                 "svcCreateEvent": "0x45",
                 "svcGetSystemInfo": "0x6f",
-                "svcCallSecureMonitor": "0x7F"
+                "svcCallSecureMonitor": "0x7F",
+                "svcGetThreadList": "0x66",
+                "svcGetProcessInfo": "0x7c"
             }
         },
         {

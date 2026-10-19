@@ -43,6 +43,12 @@
 Result CoreInit(void);
 
 /**
+ * Open the log (FILE_LOGGING) and say the process started, before the
+ * startup wait. Needs sm. No-op without logging.
+ */
+void CoreEarlyLog(void);
+
+/**
  * Cleanup core subsystems
  */
 void CoreExit(void);

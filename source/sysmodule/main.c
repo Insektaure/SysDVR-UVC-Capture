@@ -201,14 +201,18 @@ void __appInit(void)
 {
     Result rc;
 
-    // Wait out the system boot (grc:d and usb:ds are not usable right after
-    // boot2 launches us; probing them too early fails or fatals)
-    svcSleepThread(20E+9);
-
     rc = smInitialize();
     if (R_FAILED(rc)) {
         fatalThrow(rc);
     }
+
+    // First log line before the wait below: shows that this instance started
+    // at all (a restart from ovlSysmodules is otherwise invisible for 20 s)
+    CoreEarlyLog();
+
+    // Wait out the system boot (grc:d and usb:ds are not usable right after
+    // boot2 launches us; probing them too early fails or fatals)
+    svcSleepThread(20E+9);
 
     // hosversionSet is required for the HOS 5.0+ checks in usbDs setup
     rc = setsysInitialize();
