@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Build vi-tap (a libstratosphere sysmodule) inside a pinned Atmosphère tree.
 #
-#   tools/build-vi-tap.sh            -> vi-tap/vi-tap.nsp
+#   tools/build-vi-tap.sh            -> vi-tap/vi-tap.nsp (no log)
+#   VITAP_LOG=1 tools/build-vi-tap.sh -> the same, logging to the SD card
 #
 # - Atmosphère is cloned into external/ (gitignored) at AMS_TAG, never into
 #   your own checkout, and patched with tools/patch_libstrat.py.
@@ -36,6 +37,10 @@ mkdir -p "$DST"
 rsync -rlpt --checksum --delete --exclude build/ --exclude out/ \
     "$REPO/vi-tap/source/" "$DST/source/"
 cp "$REPO/include/uvctap.h" "$DST/source/"
+VITAP_LOG="${VITAP_LOG:-0}"
+case "$VITAP_LOG" in 0|1) ;; *) echo "VITAP_LOG must be 0 or 1"; exit 1 ;; esac
+printf '#pragma once\n#define VITAP_LOGGING %s\n' "$VITAP_LOG" > "$DST/source/vitap_config.hpp"
+echo "== vi-tap logging: $VITAP_LOG"
 cp "$REPO/vi-tap/vi-tap.json" "$DST/"
 cp "$AMS/stratosphere/memlet/Makefile" "$AMS/stratosphere/memlet/system_module.mk" "$DST/"
 
