@@ -572,6 +572,18 @@ a 3% (relative) worse share goes back, the mode not tried again for 20 s,
 doubled at each failure in a row up to 160 s (a load spike failed a good
 mode once: with a fixed 60 s, game 3 spent 1.5 minutes on the VIC).
 The VIC queue diagnostic is gone (its finding is above).
+Where a CPU frame's time goes (logging-build diagnostic, game 3 with cheats,
+CPU at 1020 MHz): ~14 ms of wall clock for the conversion, of which our
+thread ran only ~7.9 ms - other threads on core 3 (system services, dmnt)
+preempt it at our priority 0x3B. Flush ~0.25 ms. The last piece converted
+again while in the cache costs the same as in the frame, tiled or in row
+order: the conversion is compute and read bound (~8 cycles a pixel, ~2.3 ms
+of it reading the frame), not write bound. Zeroing each tiled output line
+with DC ZVA before writing it (no line fill from memory; checked with
+DCZID_EL0) and offsets computed once per row pair saved ~0.3-0.5 ms (7.9 ->
+7.4-7.6 ms of CPU time). The remaining lever is the ~6 ms of preemption
+(raising the thread's priority during the conversion - not done: it would
+delay core 3's services, input and audio among them, by up to ~8 ms a frame).
 Startup: the 20 s wait
 for the system to come up only applies in the first minute after boot;
 turned on later from ovlSysmodules, SysDVR-UVC starts at once. SysDVR-UVC still
