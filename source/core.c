@@ -62,11 +62,21 @@ static void _initFileLogging(void)
         return;
     if (R_SUCCEEDED(fsOpenSdCardFileSystem(&g_sdCard))) {
         g_sdMounted = true;
-        // Keep the previous start's log (a toggle in ovlSysmodules is a
-        // restart: the kill tests need what happened before it)
-        fsFsDeleteFile(&g_sdCard, "/logfile.prev.txt");
-        fsFsRenameFile(&g_sdCard, "/logfile.txt", "/logfile.prev.txt");
-        fsFsCreateFile(&g_sdCard, "/logfile.txt", 0, 0);
+        // Append across starts: a toggle in ovlSysmodules is a restart, and
+        // a few quick ones would push the run that matters out of a single
+        // previous copy. Each start's first line says which process it is.
+        // Rotate to logfile.prev.txt only past 1 MB.
+        FsFile f;
+        s64 size = 0;
+        if (R_SUCCEEDED(fsFsOpenFile(&g_sdCard, "/logfile.txt", FsOpenMode_Read, &f))) {
+            fsFileGetSize(&f, &size);
+            fsFileClose(&f);
+        }
+        if (size > 1024 * 1024) {
+            fsFsDeleteFile(&g_sdCard, "/logfile.prev.txt");
+            fsFsRenameFile(&g_sdCard, "/logfile.txt", "/logfile.prev.txt");
+        }
+        fsFsCreateFile(&g_sdCard, "/logfile.txt", 0, 0);  // fails harmlessly when it exists
     }
 }
 
@@ -200,7 +210,7 @@ void CoreEarlyLog(void)
 #endif
     u64 pid = 0;
     svcGetProcessId(&pid, CUR_PROCESS_HANDLE);
-    LOG("[%lus] process %lu started, waiting 20 s before init\n",
+    LOG("\n==== [%lus] process %lu started, waiting 20 s before init\n",
         armTicksToNs(armGetSystemTick()) / 1000000000ULL, pid);
     (void)pid;
 }

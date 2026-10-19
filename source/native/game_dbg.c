@@ -24,6 +24,16 @@
 static Service g_cht;
 static bool g_chtOpen = false;
 static Mutex g_chtLock;
+static u8* g_bounce = NULL;
+static size_t g_bounceSize = 0;
+
+void GameDbgSetBounce(void* buf, size_t size)
+{
+    mutexLock(&g_chtLock);
+    g_bounce = (u8*)buf;
+    g_bounceSize = size;
+    mutexUnlock(&g_chtLock);
+}
 
 static bool _chtService(void)
 {
@@ -100,16 +110,19 @@ bool GameDbgRead(GameDbg* d, void* dst, u64 va, size_t len)
         return R_SUCCEEDED(svcReadDebugProcessMemory(dst, d->handle, va, len));
 
     // 2 MB pieces, as SFT reads through dmnt (smaller cost too many IPCs)
-    const size_t piece = 0x200000;
     Result rc = 0;
     mutexLock(&g_chtLock);
+    const size_t piece = g_bounce ? (g_bounceSize < 0x200000 ? g_bounceSize : 0x200000) : 0x200000;
     for (size_t off = 0; off < len && R_SUCCEEDED(rc); off += piece) {
         const size_t n = len - off < piece ? len - off : piece;
         const struct { u64 address; u64 size; } in = { va + off, n };
+        u8* to = g_bounce ? g_bounce : (u8*)dst + off;
         rc = serviceDispatchIn(&g_cht, DMNT_CHT_READ_MEMORY, in,
             .buffer_attrs = { SfBufferAttr_Out | SfBufferAttr_HipcMapAlias },
-            .buffers = { { (u8*)dst + off, n } },
+            .buffers = { { to, n } },
         );
+        if (R_SUCCEEDED(rc) && g_bounce)
+            memcpy((u8*)dst + off, g_bounce, n);
     }
     mutexUnlock(&g_chtLock);
     return R_SUCCEEDED(rc);

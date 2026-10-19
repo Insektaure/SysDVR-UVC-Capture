@@ -35,8 +35,10 @@ s64 GameDbgDmntCheatCount(GameDbg* d);
 // pumps its own handle). *nev: events drained.
 Result GameDbgResume(GameDbg* d, u32* nev);
 
-// dst must be plain memory (not mapped for a device): through dmnt it is an
-// IPC buffer.
+// Through dmnt the destination is an IPC buffer, and the kernel refuses pages
+// pinned for a device (nvmap) as one (SFT: the read fails, small stack reads
+// work). With a bounce buffer set, dmnt reads go through it in pieces.
+void GameDbgSetBounce(void* buf, size_t size);
 bool GameDbgRead(GameDbg* d, void* dst, u64 va, size_t len);
 bool GameDbgQuery(GameDbg* d, MemoryInfo* mi, u64 addr);
 
