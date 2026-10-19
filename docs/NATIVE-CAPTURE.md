@@ -500,7 +500,25 @@ M96. Measured before: a GPU-heavy game that queues frames ahead (01003ec027cc800
 cost ~39 ms of fence wait per frame, ~12 fps. A light game is unchanged: the
 previous present is already encoded, so the newest is the only candidate.
 Through dmnt:cht, no rate cap any more (it was one encode per 33 ms): as fast
-as the slower copies allow. A copy the game drew over is re-read once, else skipped (8 samples, one per block row). Startup: the 20 s wait
+as the slower copies allow. A copy the game drew over is re-read once, else skipped (8 samples, one per block row). Pipelining: the next frame is copied (into a second slot copy, after the
+encoder's buffers - donor 32 MB) while the VIC converts the current one; the
+job in flight is collected, encoded and sent right after that copy, or at
+once when no newer present is waiting (no added latency when we keep up).
+Kept only where it measures faster: the capture is watched in 2 s windows
+(the share of the game's presents encoded). When it falls under 95% of a game
+presenting at 20+ fps, a 16 s trial alternates 2 s windows serial/pipelined
+(ABBA order) and compares the average share of the steady windows (loading
+screens and pauses do not count); pipelined is kept if at least 3% better
+(relative). Again every 2 minutes, or after 10 s when fewer than 2 steady
+windows per mode. With a job in flight, the next present's fence is waited
+on for up to 20 ms (the VIC works meanwhile): in 01003ec027cc8000 the newest
+present is usually still being drawn, and without that wait the copy almost
+never overlapped the job (VIC 20 ms, of which the loop waited 18; 30 fps
+either way). The log counts overlapped and lone jobs. (First version: a fixed trial 3 s into streaming - it ran
+on loading screens and never saw game 3 running.) Before it, at
+01003ec027cc8000 through dmnt:cht: copy ~10 ms + VIC ~18 ms (the compositor
+shares the VIC) + encode ~1.6 ms = ~30 fps of the game's ~47.
+Startup: the 20 s wait
 for the system to come up only applies in the first minute after boot;
 turned on later from ovlSysmodules, SysDVR-UVC starts at once. SysDVR-UVC still
 works with a v2 vi-tap (latest present only) until the next reboot.

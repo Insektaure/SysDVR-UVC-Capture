@@ -90,7 +90,7 @@ u32 NvencArenaSize(void)
 
 // ---- clocks (mm:u, checked through clkrst) ----------------------------------
 
-static u32 _clockHz(void)
+u32 NvencPcvClockHz(u32 module)
 {
     if (!CoreHasService("clkrst"))
         return 0;
@@ -98,7 +98,7 @@ static u32 _clockHz(void)
     if (R_FAILED(smGetService(&clk, "clkrst")))
         return 0;
     u32 hz = 0;
-    const struct { u32 module, unk; } in = { PCV_NVENC, 3 };  // 3: what sys-clk passes
+    const struct { u32 module, unk; } in = { module, 3 };  // 3: what sys-clk passes
     if (R_SUCCEEDED(serviceDispatchIn(&clk, 0, in, .out_num_objects = 1, .out_objects = &sess))) {
         serviceDispatchOut(&sess, 8, hz);
         serviceClose(&sess);
@@ -106,6 +106,8 @@ static u32 _clockHz(void)
     serviceClose(&clk);
     return hz;
 }
+
+static u32 _clockHz(void) { return NvencPcvClockHz(PCV_NVENC); }
 
 static Result _mmInit(u32 module, u32* id)
 {

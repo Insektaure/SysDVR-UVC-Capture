@@ -29,7 +29,16 @@ static Handle g_nvTmem = INVALID_HANDLE;
 static bool g_open = false, g_wedged = false;
 static u32 g_nvmapFd = 0, g_ctrlFd = 0, g_vicFd = 0, g_syncpt = 0;
 static u32 g_cmdHandle = 0;
-static u32 g_cfgAddr = 0, g_outAddr = 0, g_slotAddr = 0;
+static u32 g_cfgAddr = 0, g_outAddr = 0;
+// The slot copies: [0] in the capture region, [1] (VicEngineAddSlotCopy)
+// after the encoder's buffers - the next frame is copied while the VIC reads
+// the other one
+static u32 g_slotAddr[2] = { 0, 0 };
+static u8* g_slotCpu[2] = { NULL, NULL };
+// The job in flight (VicEngineSubmitTo): its fence and when it went in
+static bool g_jobPending = false;
+static u32 g_jobFence = 0;
+static u64 g_jobT0 = 0;
 static VicEngineStats g_stats;
 
 static bool _nvmapOwn(void* cpu, u32 size, bool cacheable, u32* handle)
@@ -132,8 +141,9 @@ bool VicEngineOpen(void* mem, u64 size, u32 slotBytes)
     // the command buffer is not pinned: the submit names it by nvmap handle (as SFT)
     ok = ok && _nvmapOwn(g_mem + OFF_CMD, CMD_SIZE, false, &g_cmdHandle);
     ok = ok && _nvmapOwn(g_mem + OFF_OUT, OUT_SIZE, true, &h) && _map(h, &g_outAddr, "nv12 out");
-    ok = ok && _nvmapOwn(g_mem + OFF_SLOT, slotMap, true, &h) && _map(h, &g_slotAddr, "slot copy");
-    if (ok && (!g_cfgAddr || !g_outAddr || !g_slotAddr)) {
+    ok = ok && _nvmapOwn(g_mem + OFF_SLOT, slotMap, true, &h) && _map(h, &g_slotAddr[0], "slot copy");
+    g_slotCpu[0] = g_mem + OFF_SLOT;
+    if (ok && (!g_cfgAddr || !g_outAddr || !g_slotAddr[0])) {
         LOG("vic: a buffer pinned at device address 0 - refusing to use the engine\n");
         ok = false;
     }
@@ -142,7 +152,20 @@ bool VicEngineOpen(void* mem, u64 size, u32 slotBytes)
         return false;
     }
     LOG("vic: ready - cfg 0x%x, out 0x%x, slot copy 0x%x (%u KB) in %lu MB of donor memory\n",
-        g_cfgAddr, g_outAddr, g_slotAddr, slotMap / 1024, size >> 20);
+        g_cfgAddr, g_outAddr, g_slotAddr[0], slotMap / 1024, size >> 20);
+    return true;
+}
+
+bool VicEngineAddSlotCopy(void* cpu, u64 size)
+{
+    const u32 slotMap = (g_slotBytes + 0xFFF) & ~0xFFFu;
+    u32 h = 0, addr = 0;
+    if (!g_open || g_wedged || g_slotAddr[1] || size < slotMap || ((uintptr_t)cpu & 0xFFF))
+        return false;
+    if (!_nvmapOwn(cpu, slotMap, true, &h) || !_map(h, &addr, "slot copy 2") || !addr)
+        return false;  // pins are freed with the session (VicEngineClose)
+    g_slotAddr[1] = addr;
+    g_slotCpu[1] = (u8*)cpu;
     return true;
 }
 
@@ -150,6 +173,8 @@ void VicEngineClose(void)
 {
     if (!g_open)
         return;
+    if (g_jobPending)
+        VicEngineJobWait(NULL, NULL);  // never tear the channel down under a job
     if (g_wedged) {
         // SFT M74: tearing down a channel with a job stuck in it took the
         // compositor with it. Leave everything open: the donor memory stays
@@ -164,7 +189,8 @@ void VicEngineClose(void)
     }
     g_open = false;
     g_nvmapFd = g_ctrlFd = g_vicFd = g_syncpt = g_cmdHandle = 0;
-    g_cfgAddr = g_outAddr = g_slotAddr = 0;
+    g_cfgAddr = g_outAddr = g_slotAddr[0] = g_slotAddr[1] = 0;
+    g_slotCpu[0] = g_slotCpu[1] = NULL;
     g_mem = NULL;
 }
 
@@ -176,7 +202,7 @@ bool VicEnginePin(u32 handle, u32* vicAddr) { return g_open && _map(handle, vicA
 
 bool VicEngineActive(void)  { return g_open && !g_wedged; }
 bool VicEngineWedged(void)  { return g_wedged; }
-u8* VicEngineSlotCopy(void) { return g_mem ? g_mem + OFF_SLOT : NULL; }
+u8* VicEngineSlotCopy(u32 i) { return g_open && i < 2 && g_slotAddr[i] ? g_slotCpu[i] : NULL; }
 u8* VicEngineBounce(void)   { return g_mem ? g_mem + OFF_BOUNCE : NULL; }
 size_t VicEngineBounceSize(void) { return BOUNCE_SIZE; }
 const u8* VicEngineOutput(void) { return g_mem ? g_mem + OFF_OUT : NULL; }
@@ -242,7 +268,7 @@ static void _fillConfig(VicConfigStruct* c, const VicSource* src, bool blockLine
     ss->SlotChromaHeight  = 16383;
 }
 
-static u32 _buildCmd(u32* w, const VicTarget* dst)
+static u32 _buildCmd(u32* w, const VicSource* src, const VicTarget* dst)
 {
     u32 n = 0;
     const u32 incr2 = Host1xIncr(0x10, 2);  // METHOD_OFFSET, METHOD_DATA
@@ -252,7 +278,7 @@ static u32 _buildCmd(u32* w, const VicTarget* dst)
     w[n++] = incr2; w[n++] = VIC_SET_CONFIG_STRUCT_OFFSET >> 2; w[n++] = g_cfgAddr >> 8;
     w[n++] = incr2; w[n++] = VIC_SET_OUTPUT_SURFACE_LUMA_OFFSET >> 2; w[n++] = dst->lumaAddr >> 8;
     w[n++] = incr2; w[n++] = VIC_SET_OUTPUT_SURFACE_CHROMA_U_OFFSET >> 2; w[n++] = dst->chromaAddr >> 8;
-    w[n++] = incr2; w[n++] = VIC_SET_SURFACE0_SLOT0_LUMA_OFFSET >> 2; w[n++] = g_slotAddr >> 8;
+    w[n++] = incr2; w[n++] = VIC_SET_SURFACE0_SLOT0_LUMA_OFFSET >> 2; w[n++] = g_slotAddr[src->copy] >> 8;
     w[n++] = incr2; w[n++] = VIC_EXECUTE >> 2; w[n++] = 1u << 8;
     w[n++] = Host1xNonIncr(HOST1X_UCLASS_INCR_SYNCPT, 1);
     w[n++] = (VIC_INCR_SYNCPT_COND_OP_DONE << VIC_INCR_SYNCPT_COND_SHIFT) | g_syncpt;
@@ -280,10 +306,15 @@ bool VicEngineConvert(const VicSource* src, u64* ns)
 
 bool VicEngineConvertTo(const VicSource* src, const VicTarget* dst, u64* ns)
 {
-    if (!g_open || g_wedged)
-        return false;
+    return VicEngineSubmitTo(src, dst) && VicEngineJobWait(ns, NULL);
+}
+
+bool VicEngineSubmitTo(const VicSource* src, const VicTarget* dst)
+{
+    if (!g_open || g_wedged || g_jobPending)
+        return false;  // one job at a time: the config and command buffers are single
     if (!g_cfgAddr || !dst->lumaAddr || !dst->chromaAddr || (dst->lumaAddr & 0xFF) || (dst->chromaAddr & 0xFF) ||
-        !g_slotAddr || !src->rect_w || !src->rect_h ||
+        src->copy > 1 || !g_slotAddr[src->copy] || !src->rect_w || !src->rect_h ||
         src->rect_w > src->w || src->rect_h > src->h || src->w > 16384 || src->h > 16384) {
         g_stats.refused++;  // a zero address hangs the VIC; never submit one
         return false;
@@ -292,7 +323,7 @@ bool VicEngineConvertTo(const VicSource* src, const VicTarget* dst, u64* ns)
     VicConfigStruct* cfg = (VicConfigStruct*)(g_mem + OFF_CFG);
     _fillConfig(cfg, src, dst->blockLinear);
     u32* cmd = (u32*)(g_mem + OFF_CMD);
-    const u32 words = _buildCmd(cmd, dst);
+    const u32 words = _buildCmd(cmd, src, dst);
     armDCacheFlush(cfg, CFG_SIZE);
     armDCacheFlush(cmd, CMD_SIZE);
 
@@ -310,15 +341,32 @@ bool VicEngineConvertTo(const VicSource* src, const VicTarget* dst, u64* ns)
         g_stats.refused++;
         return false;
     }
-    const u32 fence = sb[12];
+    g_jobFence = sb[12];
+    g_jobT0 = t0;
+    g_jobPending = true;
+    return true;
+}
 
-    // SYNCPT_WAIT returns early (SFT M63b): poll the value instead
+bool VicEngineJobPending(void) { return g_jobPending; }
+
+bool VicEngineJobWait(u64* ns, u64* blockedNs)
+{
+    if (!g_jobPending)
+        return false;
+    g_jobPending = false;
+    const u32 fence = g_jobFence;
+    const u64 t0 = g_jobT0, w0 = armTicksToNs(armGetSystemTick());
+
+    // SYNCPT_WAIT returns early (SFT M63b): poll the value instead. The
+    // timeout counts from the submit: a job collected late had that long.
     bool done = _syncptReached(g_syncpt, fence);
-    for (u32 i = 0; i < SUBMIT_TIMEOUT_POLLS && !done; i++) {
+    while (!done && armTicksToNs(armGetSystemTick()) - t0 < SUBMIT_TIMEOUT_POLLS * 100000ULL) {
         svcSleepThread(100000);
         done = _syncptReached(g_syncpt, fence);
     }
-    const u64 dt = armTicksToNs(armGetSystemTick()) - t0;
+    const u64 now = armTicksToNs(armGetSystemTick()), dt = now - t0;
+    if (blockedNs)
+        *blockedNs = now - w0;
     if (!done) {
         g_stats.timeouts++;
         g_wedged = true;

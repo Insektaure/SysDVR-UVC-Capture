@@ -28,6 +28,7 @@ typedef struct {
     u32 pixfmt;         // VIC_PIXFMT_*: A8R8G8B8 for the game's A8B8G8R8 (bytes R,G,B,A)
     u32 rect_w, rect_h; // what the game presents, from (0,0): converted to 1280x720
     u32 flip;           // present transform: bit 0 flip-H, bit 1 flip-V
+    u32 copy;           // the slot copy holding it (VicEngineSlotCopy)
 } VicSource;
 
 // mem/size: the donor's capture region. slotBytes: the largest buffer the
@@ -41,10 +42,15 @@ bool VicEngineActive(void);
 u64  VicEngineBytesUsed(void);
 bool VicEngineWedged(void);
 
-// Where the caller copies the game's buffer (same offsets as in the game),
-// and a plain (unpinned) buffer for reads through dmnt:cht: pinned pages
-// cannot be an IPC buffer.
-u8*    VicEngineSlotCopy(void);
+// Where the caller copies the game's buffer (same offsets as in the game):
+// copy 0, and copy 1 once added. NULL for a copy that does not exist. And a
+// plain (unpinned) buffer for reads through dmnt:cht: pinned pages cannot be
+// an IPC buffer.
+u8*    VicEngineSlotCopy(u32 i);
+// A second slot copy (pipelining: the next frame is copied while the VIC
+// reads the other), page-aligned, at least the slot's size. Pinned until
+// VicEngineClose.
+bool   VicEngineAddSlotCopy(void* cpu, u64 size);
 u8*    VicEngineBounce(void);
 size_t VicEngineBounceSize(void);
 const u8* VicEngineOutput(void);
@@ -62,6 +68,15 @@ typedef struct {
     bool blockLinear;
 } VicTarget;
 bool VicEngineConvertTo(const VicSource* src, const VicTarget* dst, u64* ns);
+
+// The same in two halves: the job goes in, the caller does something else
+// (copies the next frame), then collects it. One job at a time; nothing may
+// touch its slot copy or target until collected. *ns: submit to collected,
+// *blockedNs: how long JobWait itself waited. A job not done 0.5 s after its
+// submit wedges the engine (JobWait returns false).
+bool VicEngineSubmitTo(const VicSource* src, const VicTarget* dst);
+bool VicEngineJobPending(void);
+bool VicEngineJobWait(u64* ns, u64* blockedNs);
 
 // For the encoder: the same nvdrv session's nvmap and ctrl fds, and a pin of
 // one more buffer (cached) in the VIC channel.

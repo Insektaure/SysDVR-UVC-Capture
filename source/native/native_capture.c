@@ -34,14 +34,30 @@
 #define SIG_POINTS        32
 #define SAMPLE_DELAY_NS   8000000ULL   // without the engine (no nvdrv): no fence wait, let the GPU finish
 #define FENCE_TIMEOUT_NS  250000000ULL // SFT v0.7.1: some games queue ~20 ms (up to 68) before the GPU is done
+#define PIPE_FENCE_NS     20000000ULL  // with a job in flight: how long the next present may keep it waiting
 #define READ_EVERY_NS     1000000000ULL
 #define DUMPS_PER_SESSION 3
 #define PAUSED_NS         1000000000ULL  // no present for this long: the game is suspended
 #define MAX_BUF_BYTES     (16u * 1024 * 1024)
 #define CHUNK             0x20000      // reads go through this; dumps are written from it piece by piece
 #define DUMP_DIR          "/config/sysdvr-uvc/dump"
-#define DONOR_MB          24           // per game session: VIC buffers + slot copy (12.5 MB), encoder arena (7.1), frame (1.5)
+#define DONOR_MB          32           // per game session: VIC buffers + slot copy (12.5 MB), encoder arena (7.1), frame (1.5), second slot copy (8.5)
 #define ENCODE_QP         20           // SFT: constant QP 20 (P frames 22)
+// Pipelining: the next frame is copied while the VIC converts this one. Kept
+// only where it measures faster. The capture is watched in 2 s windows: the
+// share of the game's presents it encodes. When it falls behind a game that
+// presents steadily (loading screens and pauses do not count), a trial
+// alternates windows of each mode (ABBA: a trend in the game's load hits both
+// alike) and compares their average share. Again every TRIAL_EVERY_NS, or
+// soon when the trial saw too few steady windows to tell.
+#define TRIAL_WINDOW_NS   2000000000ULL
+#define TRIAL_WINDOWS     8
+#define TRIAL_EVERY_NS    120000000000ULL
+#define TRIAL_RETRY_NS    10000000000ULL
+#define TRIAL_MIN_FPS     20           // a window counts when the game presented at least this fast
+#define TRIAL_BEHIND_PML  950          // a trial is worth it below this share (per mille) of the game's presents
+#define TRIAL_GAIN_PCT    3            // pipelined must capture this much more (relative) to be kept
+static const bool kTrialPipe[TRIAL_WINDOWS] = { false, true, true, false, false, true, true, false };
 #define H264_DUMP_FRAMES  0            // 3a wrote the first N frames to <program>.h264; off while streaming (SD writes cost latency)
 
 extern volatile bool g_nativeCaptureRunning;
@@ -88,7 +104,24 @@ typedef struct {
     u32    convs, convFails, fenceTimeouts;
     u32    ivConvs;
     u64    ivReadNs, ivVicNs, ivFenceNs, ivFenceMax, ivReadBytes;
-    u32    ivFences;
+    u32    ivFences, ivCopies;
+    u64    ivVicWaitNs;      // of ivVicNs, what the loop spent waiting for the VIC
+    u32    ivOverlapped, ivAlone;  // pipelined jobs collected after the next copy / with nothing to overlap
+
+    // pipelining (TRIAL_*)
+    bool   pipe;             // copy the next frame while the VIC converts this one
+    bool   pending;          // a VIC job in flight
+    bool   again;            // a newer present was left for after the job: look again at once
+    UvcTapPresent job;       // its present
+    u32    jobCopy;          // the slot copy it reads
+    bool   pipeKept;         // what the last conclusive trial chose
+    u64    winStartNs;       // the window being watched (0: none)
+    u64    winSeq;
+    u32    winConvs;
+    u64    nextTrialNs;
+    u32    trialWin;         // windows done in the running trial (0: none running)
+    u32    trialSum[2], trialN[2], trialFps[2];  // per mode: shares (per mille) and fps of the steady windows
+    u16    trialPml[TRIAL_WINDOWS];             // each window's share, 0xFFFF: not steady
 
     // H.264 (phase 3a) and the camera (3b)
     u32    encFails;
@@ -331,10 +364,19 @@ static void _takeMemory(Session* s)
         return;
     }
     u8* m8 = (u8*)s->mem;
-    if (NvencOpen(m8 + arenaOff, NvencArenaSize(), m8 + frameOff, NvencFrameBufferSize(), ENCODE_QP) && !g_blackLen) {
-        if (NvencEncodeBlack(g_black, sizeof(g_black), &g_blackLen))
-            LOG("native: black keyframe for the gaps between games: %u B\n", g_blackLen);
-    }
+    if (!NvencOpen(m8 + arenaOff, NvencArenaSize(), m8 + frameOff, NvencFrameBufferSize(), ENCODE_QP))
+        return;
+    if (!g_blackLen && NvencEncodeBlack(g_black, sizeof(g_black), &g_blackLen))
+        LOG("native: black keyframe for the gaps between games: %u B\n", g_blackLen);
+
+    // the second slot copy, for pipelining, after the encoder's frame buffer
+    const u64 copyOff = (frameOff + NvencFrameBufferSize() + 0xFFFF) & ~0xFFFFULL;
+    const u64 copySize = ((u64)s->surf.buf_size + 0xFFF) & ~0xFFFULL;
+    if (copyOff + copySize <= s->memSize && VicEngineAddSlotCopy(m8 + copyOff, copySize))
+        LOG("native: second slot copy (%lu KB): pipelining possible, tried once streaming\n", copySize / 1024);
+    else
+        LOG("native: no second slot copy (%lu MB of donor memory, needs %lu) - copy and conversion one after the other\n",
+            s->memSize >> 20, (copyOff + copySize + 0xFFFFF) >> 20);
 }
 
 // The first H264_DUMP_FRAMES encoded frames of a session, as an Annex-B
@@ -379,10 +421,13 @@ static void _h264Append(Session* s, const u8* data, u32 len)
 
 // The order matters: no dmnt read may use the bounce once the memory goes;
 // the nvdrv session must be closed (freeing every pin) before the unmap.
+static void _finish(Session* s);
+
 static void _releaseMemory(Session* s)
 {
     if (!s->mem)
         return;
+    _finish(s);  // never a job in flight on memory that goes
     GameDbgSetBounce(NULL, 0);
     NvencClose();
     VicEngineClose();
@@ -403,6 +448,7 @@ static void _source(const Session* s, const UvcTapPresent* p, VicSource* src)
     // usual A8B8G8R8 (bytes R,G,B,A) its A8R8G8B8 - the matrix is measured so
     src->pixfmt = s->surf.color_format == 0x100d12120ULL ? VIC_PIXFMT_A8B8G8R8 : VIC_PIXFMT_A8R8G8B8;
     src->flip = p->transform & 3;
+    src->copy = 0;
     const u32 cw = p->crop[2] - p->crop[0], ch = p->crop[3] - p->crop[1];
     const bool ok = p->crop[0] == 0 && p->crop[1] == 0 && p->crop[2] > 0 && p->crop[3] > 0 &&
                     cw >= 320 && ch >= 180 && cw <= src->w && ch <= src->h &&
@@ -434,7 +480,7 @@ static Region _region(const VicSource* src)
 static bool _changedSinceRead(Session* s, u64 addr, const VicSource* src)
 {
     const Region r = _region(src);
-    const u8* copy = VicEngineSlotCopy();
+    const u8* copy = VicEngineSlotCopy(src->copy);
     for (u32 k = 0; k < 8 && r.rows; k++) {
         const u64 off = (k % r.rows) * r.rowBytes + (((u64)k * 0x2340u % r.readPerRow) & ~63ULL);
         if (off + 64 > s->surf.buf_size)
@@ -451,7 +497,7 @@ static bool _changedSinceRead(Session* s, u64 addr, const VicSource* src)
 
 static bool _readRegion(Session* s, u64 addr, const VicSource* src, u64* bytes)
 {
-    u8* copy = VicEngineSlotCopy();
+    u8* copy = VicEngineSlotCopy(src->copy);
     const Region reg = _region(src);
     const u64 rowBytes = reg.rowBytes, readPerRow = reg.readPerRow, rows = reg.rows;
     u64 total = 0;
@@ -475,7 +521,12 @@ static bool _readRegion(Session* s, u64 addr, const VicSource* src, u64* bytes)
 // none is, the oldest - the GPU finishes them in order, it is next. Its slot
 // stays intact until the present after the next one is drawn; the copy is
 // checked anyway (_changedSinceRead).
-static bool _pickPresent(Session* s, const UvcTapPresent* latest, UvcTapPresent* out)
+// With a job in flight the fence wait is short (PIPE_FENCE_NS): the VIC
+// works meanwhile, but the job's frame waits on us. A GPU-heavy game is
+// usually still drawing its newest present when we look (01003ec027cc8000:
+// without this wait, the copy almost never overlapped the job). Not done by
+// then: the present is left for after the job (s->again).
+static bool _pickPresent(Session* s, const UvcTapPresent* latest, UvcTapPresent* out, bool inFlight)
 {
     UvcTapPresent r[UVCTAP_RECENT_MAX];
     u32 n = 0;
@@ -497,8 +548,13 @@ static bool _pickPresent(Session* s, const UvcTapPresent* latest, UvcTapPresent*
         s->ivPickReady++;
     } else if (oldest >= 0) {
         u64 waited = 0;
-        if (!VicEngineWaitFence(r[oldest].fence_count, r[oldest].fence, FENCE_TIMEOUT_NS, &waited))
+        if (!VicEngineWaitFence(r[oldest].fence_count, r[oldest].fence, inFlight ? PIPE_FENCE_NS : FENCE_TIMEOUT_NS, &waited)) {
+            if (inFlight) {
+                s->again = true;
+                return false;
+            }
             s->fenceTimeouts++;
+        }
         s->ivFenceNs += waited;
         s->ivFences++;
         if (waited > s->ivFenceMax)
@@ -514,74 +570,175 @@ static bool _pickPresent(Session* s, const UvcTapPresent* latest, UvcTapPresent*
     return true;
 }
 
-// One present through the VIC: copy, convert (and encode, and send when a
-// camera app streams). The fence was waited on.
-static bool _convert(Session* s, const UvcTapPresent* p, bool send)
+// The job in flight: collect it, encode its picture, send it.
+static void _finish(Session* s)
 {
-    VicSource src;
-    _source(s, p, &src);
-    u64 bytes = 0, vicNs = 0;
-    const u64 addr = _slotAddr(s, p->slot);
-    const u64 t0 = _nowNs();
-    if (!_readRegion(s, addr, &src, &bytes)) {
+    if (!s->pending)
+        return;
+    s->pending = false;
+    u64 vicNs = 0, waitNs = 0;
+    if (!VicEngineJobWait(&vicNs, &waitNs)) {
         s->convFails++;
-        return false;
-    }
-    if (_changedSinceRead(s, addr, &src)) {
-        s->rereads++;
-        if (!_readRegion(s, addr, &src, &bytes) || _changedSinceRead(s, addr, &src)) {
-            s->torn++;  // skip it: the P chain goes on from the last frame we encoded
-            return false;
-        }
-    }
-    const u64 t1 = _nowNs();
-    if (NvencActive()) {
-        // straight into the encoder's picture, in its 16-row block-linear layout
-        VicTarget t = { 0, 0, true };
-        NvencPictureTarget(&t.lumaAddr, &t.chromaAddr);
-        if (!VicEngineConvertTo(&src, &t, &vicNs)) {
-            s->convFails++;
-            return false;
-        }
-        const u8* frame = NULL;
-        u32 len = 0;
-        bool idr = false;
-        u64 encNs = 0;
-        if (NvencEncode(s->needKey, &frame, &len, &idr, &encNs)) {
-            s->ivEncNs += encNs;
-            s->needKey = false;
-            _h264Append(s, frame, len);
-            if (send) {
-                if (UvcDeviceSendFrame(frame, len, armTicksToNs(p->tick) / 1000000, idr)) {
-                    g_lastSentNs = _nowNs();
-                    if (s->sent == 0) {
-                        const u64 now = _nowNs();
-                        LOG("native: first frame sent (%s, %u KB): %lu ms after the game appeared, %lu ms after attaching\n",
-                            idr ? "keyframe" : "P frame", len / 1024, g_appSinceNs ? (now - g_appSinceNs) / 1000000 : 0,
-                            (now - s->attachTick) / 1000000);
-                    }
-                    s->sent++;
-                    s->ivSent++;
-                    s->ivSentBytes += len;
-                } else {
-                    s->sendFails++;
-                    s->needKey = true;  // the host lost a frame: P frames after it would decode wrong
-                }
-            }
-        } else {
-            s->encFails++;
-            s->needKey = true;
-        }
-    } else if (!VicEngineConvert(&src, &vicNs)) {
-        s->convFails++;
-        return false;
+        return;
     }
     s->convs++;
     s->ivConvs++;
-    s->ivReadNs += t1 - t0;
     s->ivVicNs += vicNs;
+    s->ivVicWaitNs += waitNs;
+    const UvcTapPresent* p = &s->job;
+    const u8* frame = NULL;
+    u32 len = 0;
+    bool idr = false;
+    u64 encNs = 0;
+    if (!NvencEncode(s->needKey, &frame, &len, &idr, &encNs)) {
+        s->encFails++;
+        s->needKey = true;
+        return;
+    }
+    s->ivEncNs += encNs;
+    s->needKey = false;
+    _h264Append(s, frame, len);
+    if (UvcDeviceSendFrame(frame, len, armTicksToNs(p->tick) / 1000000, idr)) {
+        g_lastSentNs = _nowNs();
+        if (s->sent == 0) {
+            const u64 now = _nowNs();
+            LOG("native: first frame sent (%s, %u KB): %lu ms after the game appeared, %lu ms after attaching\n",
+                idr ? "keyframe" : "P frame", len / 1024, g_appSinceNs ? (now - g_appSinceNs) / 1000000 : 0,
+                (now - s->attachTick) / 1000000);
+        }
+        s->sent++;
+        s->ivSent++;
+        s->ivSentBytes += len;
+    } else {
+        s->sendFails++;
+        s->needKey = true;  // the host lost a frame: P frames after it would decode wrong
+    }
+}
+
+// One present: copy it into the slot copy the VIC is not reading, then a VIC
+// job straight into the encoder's picture (16-row block-linear). The job in
+// flight, if any, is collected (encoded, sent) after this copy - the copy
+// overlapped its conversion. Pipelined, this job is left in flight; otherwise
+// collected at once, as before. The fence was waited on. Returns whether a
+// job is left in flight.
+static bool _convert(Session* s, const UvcTapPresent* p)
+{
+    if (!NvencActive())
+        return false;
+    if (s->pending && !VicEngineSlotCopy(s->jobCopy ^ 1))
+        _finish(s);
+    if (s->pending)
+        s->ivOverlapped++;
+    VicSource src;
+    _source(s, p, &src);
+    src.copy = s->pending ? s->jobCopy ^ 1 : 0;
+    u64 bytes = 0;
+    const u64 addr = _slotAddr(s, p->slot);
+    const u64 t0 = _nowNs();
+    bool ok = _readRegion(s, addr, &src, &bytes);
+    if (!ok) {
+        s->convFails++;
+    } else if (_changedSinceRead(s, addr, &src)) {
+        s->rereads++;
+        if (!_readRegion(s, addr, &src, &bytes) || _changedSinceRead(s, addr, &src)) {
+            s->torn++;  // skip it: the P chain goes on from the last frame we encoded
+            ok = false;
+        }
+    }
+    const u64 t1 = _nowNs();
+    _finish(s);  // the encoder's picture is free again
+    if (!ok)
+        return false;
+    s->ivCopies++;
+    s->ivReadNs += t1 - t0;
     s->ivReadBytes += bytes;
-    return true;
+    VicTarget t = { 0, 0, true };
+    NvencPictureTarget(&t.lumaAddr, &t.chromaAddr);
+    if (!VicEngineSubmitTo(&src, &t)) {
+        s->convFails++;
+        return false;
+    }
+    s->pending = true;
+    s->job = *p;
+    s->jobCopy = src.copy;
+    if (!s->pipe)
+        _finish(s);
+    return s->pending;
+}
+
+// The pipelining trial (TRIAL_*), while frames go to the camera
+static void _pipeControl(Session* s, const UvcTapPresent* p, bool encodeable)
+{
+    if (!VicEngineSlotCopy(1)) {
+        s->pipe = false;
+        return;
+    }
+    const u64 now = _nowNs();
+    if (!encodeable || s->sent == 0) {
+        if (s->trialWin) {  // the camera stopped: a trial must see a steady stream
+            s->trialWin = 0;
+            s->pipe = s->pipeKept;
+        }
+        s->winStartNs = 0;
+        return;
+    }
+    if (s->winStartNs && now - s->winStartNs < TRIAL_WINDOW_NS)
+        return;
+
+    // a window ends (none at the first call)
+    const bool had = s->winStartNs != 0;
+    const u64 span = now - s->winStartNs, pres = p->seq - s->winSeq, conv = s->convs - s->winConvs;
+    const bool steady = had && pres * 1000000000ULL >= TRIAL_MIN_FPS * span;
+    const u32 pml = pres ? (u32)(conv * 1000 / pres) : 1000;
+    s->winStartNs = now;
+    s->winSeq = p->seq;
+    s->winConvs = s->convs;
+    if (!had)
+        return;
+
+    if (s->trialWin) {
+        s->trialPml[s->trialWin - 1] = steady ? (u16)pml : 0xFFFF;
+        if (steady) {
+            s->trialSum[s->pipe] += pml;
+            s->trialN[s->pipe]++;
+            s->trialFps[s->pipe] += (u32)(conv * 1000000000ULL / span);
+        }
+        if (s->trialWin < TRIAL_WINDOWS) {
+            s->pipe = kTrialPipe[s->trialWin++];
+            return;
+        }
+        char wins[TRIAL_WINDOWS * 8 + 1];
+        u32 len = 0;
+        for (u32 k = 0; k < TRIAL_WINDOWS; k++) {
+            if (s->trialPml[k] == 0xFFFF)
+                len += snprintf(wins + len, sizeof(wins) - len, " %c -", kTrialPipe[k] ? 'P' : 'S');
+            else
+                len += snprintf(wins + len, sizeof(wins) - len, " %c %u", kTrialPipe[k] ? 'P' : 'S', s->trialPml[k] / 10);
+        }
+        s->trialWin = 0;
+        if (s->trialN[0] < 2 || s->trialN[1] < 2) {
+            s->pipe = s->pipeKept;
+            s->nextTrialNs = now + TRIAL_RETRY_NS;
+            LOG("native: pipelining trial: too few steady windows (%%:%s) - keeping %s, again in %lu s\n",
+                wins, s->pipe ? "pipelined" : "one after the other", TRIAL_RETRY_NS / 1000000000ULL);
+            return;
+        }
+        const u32 m0 = s->trialSum[0] / s->trialN[0], m1 = s->trialSum[1] / s->trialN[1];
+        s->pipe = s->pipeKept = m1 * 100 > m0 * (100 + TRIAL_GAIN_PCT);
+        s->nextTrialNs = now + TRIAL_EVERY_NS;
+        LOG("native: pipelining trial (%%:%s): one after the other %u fps (%u%% of the game's frames), "
+            "pipelined %u fps (%u%%) -> %s, again in %lu s\n", wins,
+            s->trialFps[0] / s->trialN[0], m0 / 10, s->trialFps[1] / s->trialN[1], m1 / 10,
+            s->pipe ? "pipelined" : "one after the other", TRIAL_EVERY_NS / 1000000000ULL);
+        return;
+    }
+
+    // worth a trial: behind a steadily presenting game (or time to check the
+    // pipelined choice again)
+    if (steady && now >= s->nextTrialNs && (s->pipe || pml < TRIAL_BEHIND_PML)) {
+        s->trialSum[0] = s->trialSum[1] = s->trialN[0] = s->trialN[1] = s->trialFps[0] = s->trialFps[1] = 0;
+        s->pipe = kTrialPipe[s->trialWin++];
+    }
 }
 
 static void _endSession(Session* s, const char* why)
@@ -815,6 +972,7 @@ static void _dumpNv12(Session* s, const UvcTapPresent* p)
         LOG("native: dump %u: SD card not available\n", n);
         return;
     }
+    _finish(s);  // the VIC is ours, and so is slot copy 0
     VicSource src;
     _source(s, p, &src);
     u64 bytes = 0, vicNs = 0;
@@ -876,13 +1034,16 @@ static void _logPeriodic(Session* s, const UvcTapPresent* p)
     if (VicEngineActive() || VicEngineWedged()) {
         VicEngineStats vs;
         VicEngineGetStats(&vs, true);
-        const u64 n = s->ivConvs ? s->ivConvs : 1;
-        LOG("native: presents last 10 s: %u already finished, %u waited for, %u newer skipped (vi-tap protocol %u)\n",
-            s->ivPickReady, s->ivPickWaited, s->ivSkipped, TapClientVersion());
+        const u64 n = s->ivConvs ? s->ivConvs : 1, nc = s->ivCopies ? s->ivCopies : 1;
+        LOG("native: presents last 10 s: %u already finished, %u waited for, %u newer skipped (vi-tap protocol %u); "
+            "pipelined jobs: %u overlapped by the next copy, %u not\n",
+            s->ivPickReady, s->ivPickWaited, s->ivSkipped, TapClientVersion(), s->ivOverlapped, s->ivAlone);
         LOG("native: VIC last 10 s: %u frames (%lu.%lu fps), per frame avg: fence wait %lu us (max %lu), read %lu KB in %lu us, "
-            "VIC %lu us (max %lu) | total %u, failed %u, fence timeouts %u%s\n",
+            "VIC %lu us (max %lu, waited for %lu) | %s | total %u, failed %u, fence timeouts %u%s\n",
             s->ivConvs, (u64)s->ivConvs / 10, (u64)s->ivConvs % 10, s->ivFenceNs / (s->ivFences ? s->ivFences : 1) / 1000, s->ivFenceMax / 1000,
-            s->ivReadBytes / n / 1024, s->ivReadNs / n / 1000, s->ivVicNs / n / 1000, vs.nsMax / 1000,
+            s->ivReadBytes / nc / 1024, s->ivReadNs / nc / 1000, s->ivVicNs / n / 1000, vs.nsMax / 1000, s->ivVicWaitNs / n / 1000,
+            !VicEngineSlotCopy(1) ? "one after the other (no second copy)" : s->trialWin ? "pipelining trial running" :
+            s->pipe ? "pipelined" : "one after the other",
             s->convs, s->convFails, s->fenceTimeouts, VicEngineWedged() ? " - ENGINE WEDGED" : "");
         if (NvencActive() || NvencWedged()) {
             NvencStats es;
@@ -901,9 +1062,16 @@ static void _logPeriodic(Session* s, const UvcTapPresent* p)
                 es.frames > es.idrs ? es.bytesP / (es.frames - es.idrs) / 1024 : 0, es.errors,
                 es.clockHz / 1000000, NvencWedged() ? " - ENGINE WEDGED" : "");
         }
+#if LOGGING_ENABLED
+        // read only: why the VIC takes 20 ms in some games and 0.6 in others
+        LOG("native: clocks now: VIC %u MHz, EMC %u MHz, GPU %u MHz\n", NvencPcvClockHz(0x4000002Fu) / 1000000,
+            NvencPcvClockHz(0x40000039u) / 1000000, NvencPcvClockHz(0x40000002u) / 1000000);
+#endif
         s->ivConvs = 0;
         s->ivReadNs = s->ivVicNs = s->ivFenceNs = s->ivFenceMax = s->ivReadBytes = 0;
-        s->ivFences = 0;
+        s->ivFences = s->ivCopies = 0;
+        s->ivVicWaitNs = 0;
+        s->ivOverlapped = s->ivAlone = 0;
         s->ivPickReady = s->ivPickWaited = s->ivSkipped = 0;
         s->ivEncNs = 0;
     }
@@ -911,8 +1079,8 @@ static void _logPeriodic(Session* s, const UvcTapPresent* p)
 
 static void _filler(Session* s)
 {
-    if (!UvcDeviceIsStreaming() || _nowNs() - g_lastSentNs < FILLER_NS)
-        return;
+    if (!UvcDeviceIsStreaming() || _nowNs() - g_lastSentNs < FILLER_NS || s->pending)
+        return;  // (a job in flight: a frame is coming, and it is writing the encoder's picture)
     const u8* frame = NULL;
     u32 len = 0;
     bool idr = false;
@@ -957,8 +1125,11 @@ void NativeCaptureThread(void* arg)
         }
 
         Event* ev = TapClientPresentEvent();
-        // while an app streams, wake at least as often as the keep-alive needs
-        bool woke = R_SUCCEEDED(eventWait(ev, UvcDeviceIsStreaming() ? FILLER_NS / 2 : 1000000000ULL));
+        // while an app streams, wake at least as often as the keep-alive
+        // needs; a job in flight or a present left for after it: no waiting
+        const bool again = s->again;
+        s->again = false;
+        bool woke = R_SUCCEEDED(eventWait(ev, s->pending || again ? 0 : UvcDeviceIsStreaming() ? FILLER_NS / 2 : 1000000000ULL));
         if (woke)
             eventClear(ev);
 
@@ -1026,7 +1197,11 @@ void NativeCaptureThread(void* arg)
             }
         }
 
-        if (s->attached && woke && p.seq != s->lastSeq) {
+        if (s->attached)
+            _pipeControl(s, &p, s->locked && NvencActive() && UvcDeviceIsStreaming());
+
+        bool inFlight = false;  // a job submitted in this pass, its collection overlapping the next copy
+        if (s->attached && ((woke && p.seq != s->lastSeq) || again)) {
             const bool streaming = UvcDeviceIsStreaming();
             const bool encodeable = s->locked && NvencActive() && streaming;
             if (!s->locked) {
@@ -1066,9 +1241,9 @@ void NativeCaptureThread(void* arg)
             // a copy is slower (7-27 ms for 3.75 MB, direct 2.2 ms), and one
             // the game drew over is re-read or skipped (_changedSinceRead)
             UvcTapPresent pick;
-            if (encodeable && _pickPresent(s, &p, &pick)) {
+            if (encodeable && _pickPresent(s, &p, &pick, s->pending)) {
                 s->lastEncSeq = pick.seq;
-                _convert(s, &pick, true);
+                inFlight = _convert(s, &pick);
             }
 #if NATIVE_DEBUG
             else if (s->locked && !NvencActive() && _nowNs() >= s->nextRead) {
@@ -1076,6 +1251,12 @@ void NativeCaptureThread(void* arg)
                 s->nextRead = _nowNs() + READ_EVERY_NS;
             }
 #endif
+        }
+
+        // nothing newer to copy meanwhile: the frame in flight goes out now
+        if (s->pending && !inFlight) {
+            s->ivAlone++;
+            _finish(s);
         }
 
 #if NATIVE_DEBUG

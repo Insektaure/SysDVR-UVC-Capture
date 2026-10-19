@@ -47,6 +47,10 @@ bool NvencEncode(bool idr, const u8** data, u32* len, bool* isIdr, u64* ns);
 // goes silent. The next NvencEncode starts a new chain from a keyframe.
 bool NvencEncodeBlack(u8* out, u32 max, u32* len);
 
+// A clock's current rate, read through clkrst (pcv module id, e.g.
+// 0x4000002F VIC, 0x40000039 EMC, 0x40000002 GPU). 0 when unreadable.
+u32  NvencPcvClockHz(u32 module);
+
 typedef struct {
     u32 frames, idrs, errors, timeouts;
     u64 bytesI, bytesP, nsTotal, nsMax;
