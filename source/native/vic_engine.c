@@ -168,6 +168,12 @@ void VicEngineClose(void)
     g_mem = NULL;
 }
 
+u64 VicEngineBytesUsed(void) { return g_open ? OFF_SLOT + ((g_slotBytes + 0xFFFu) & ~0xFFFu) : 0; }
+u32 VicEngineNvmapFd(void) { return g_nvmapFd; }
+u32 VicEngineCtrlFd(void)  { return g_ctrlFd; }
+bool VicEngineNvmapOwn(void* cpu, u32 size, bool cacheable, u32* handle) { return g_open && _nvmapOwn(cpu, size, cacheable, handle); }
+bool VicEnginePin(u32 handle, u32* vicAddr) { return g_open && _map(handle, vicAddr, "external"); }
+
 bool VicEngineActive(void)  { return g_open && !g_wedged; }
 bool VicEngineWedged(void)  { return g_wedged; }
 u8* VicEngineSlotCopy(void) { return g_mem ? g_mem + OFF_SLOT : NULL; }
@@ -177,7 +183,7 @@ const u8* VicEngineOutput(void) { return g_mem ? g_mem + OFF_OUT : NULL; }
 
 static inline u64 _s20(s32 v) { return (u64)((u32)v & 0xFFFFFu); }
 
-static void _fillConfig(VicConfigStruct* c, const VicSource* src)
+static void _fillConfig(VicConfigStruct* c, const VicSource* src, bool blockLinear)
 {
     memset(c, 0, sizeof(*c));
 
@@ -191,7 +197,9 @@ static void _fillConfig(VicConfigStruct* c, const VicSource* src)
     c->outputConfig.OutputFlipY      = (src->flip & 2) ? 1 : 0;
 
     c->outputSurfaceConfig.OutPixelFormat   = VIC_PIXFMT_Y8_U8V8_N420;
-    c->outputSurfaceConfig.OutBlkKind       = VIC_BLK_KIND_PITCH;
+    // NVENC reads 16-row blocks: generic 16Bx2, 2^1 GOBs (SFT M82/M83)
+    c->outputSurfaceConfig.OutBlkKind       = blockLinear ? VIC_BLK_KIND_GENERIC_16Bx2 : VIC_BLK_KIND_PITCH;
+    c->outputSurfaceConfig.OutBlkHeight     = blockLinear ? 1 : 0;
     c->outputSurfaceConfig.OutSurfaceWidth  = VIC_OUT_W - 1;
     c->outputSurfaceConfig.OutSurfaceHeight = VIC_OUT_H - 1;
     c->outputSurfaceConfig.OutLumaWidth     = VIC_OUT_W - 1;  // stride = width
@@ -234,7 +242,7 @@ static void _fillConfig(VicConfigStruct* c, const VicSource* src)
     ss->SlotChromaHeight  = 16383;
 }
 
-static u32 _buildCmd(u32* w)
+static u32 _buildCmd(u32* w, const VicTarget* dst)
 {
     u32 n = 0;
     const u32 incr2 = Host1xIncr(0x10, 2);  // METHOD_OFFSET, METHOD_DATA
@@ -242,8 +250,8 @@ static u32 _buildCmd(u32* w)
     w[n++] = incr2; w[n++] = VIC_SET_APPLICATION_ID >> 2;  w[n++] = 1;
     w[n++] = incr2; w[n++] = VIC_SET_CONTROL_PARAMS >> 2;  w[n++] = (u32)(sizeof(VicConfigStruct) / 16) << 16;
     w[n++] = incr2; w[n++] = VIC_SET_CONFIG_STRUCT_OFFSET >> 2; w[n++] = g_cfgAddr >> 8;
-    w[n++] = incr2; w[n++] = VIC_SET_OUTPUT_SURFACE_LUMA_OFFSET >> 2; w[n++] = g_outAddr >> 8;
-    w[n++] = incr2; w[n++] = VIC_SET_OUTPUT_SURFACE_CHROMA_U_OFFSET >> 2; w[n++] = (g_outAddr + VIC_OUT_LUMA) >> 8;
+    w[n++] = incr2; w[n++] = VIC_SET_OUTPUT_SURFACE_LUMA_OFFSET >> 2; w[n++] = dst->lumaAddr >> 8;
+    w[n++] = incr2; w[n++] = VIC_SET_OUTPUT_SURFACE_CHROMA_U_OFFSET >> 2; w[n++] = dst->chromaAddr >> 8;
     w[n++] = incr2; w[n++] = VIC_SET_SURFACE0_SLOT0_LUMA_OFFSET >> 2; w[n++] = g_slotAddr >> 8;
     w[n++] = incr2; w[n++] = VIC_EXECUTE >> 2; w[n++] = 1u << 8;
     w[n++] = Host1xNonIncr(HOST1X_UCLASS_INCR_SYNCPT, 1);
@@ -262,18 +270,29 @@ static bool _syncptReached(u32 id, u32 want)
 
 bool VicEngineConvert(const VicSource* src, u64* ns)
 {
+    const VicTarget own = { g_outAddr, g_outAddr + VIC_OUT_LUMA, false };
+    if (!VicEngineConvertTo(src, &own, ns))
+        return false;
+    // the engine wrote through the device side: drop our stale cache lines
+    armDCacheFlush(g_mem + OFF_OUT, VIC_OUT_BYTES);
+    return true;
+}
+
+bool VicEngineConvertTo(const VicSource* src, const VicTarget* dst, u64* ns)
+{
     if (!g_open || g_wedged)
         return false;
-    if (!g_cfgAddr || !g_outAddr || !g_slotAddr || !src->rect_w || !src->rect_h ||
+    if (!g_cfgAddr || !dst->lumaAddr || !dst->chromaAddr || (dst->lumaAddr & 0xFF) || (dst->chromaAddr & 0xFF) ||
+        !g_slotAddr || !src->rect_w || !src->rect_h ||
         src->rect_w > src->w || src->rect_h > src->h || src->w > 16384 || src->h > 16384) {
         g_stats.refused++;  // a zero address hangs the VIC; never submit one
         return false;
     }
 
     VicConfigStruct* cfg = (VicConfigStruct*)(g_mem + OFF_CFG);
-    _fillConfig(cfg, src);
+    _fillConfig(cfg, src, dst->blockLinear);
     u32* cmd = (u32*)(g_mem + OFF_CMD);
-    const u32 words = _buildCmd(cmd);
+    const u32 words = _buildCmd(cmd, dst);
     armDCacheFlush(cfg, CFG_SIZE);
     armDCacheFlush(cmd, CMD_SIZE);
 
@@ -307,8 +326,6 @@ bool VicEngineConvert(const VicSource* src, u64* ns)
             g_syncpt, fence);
         return false;
     }
-    // the engine wrote through the device side: drop our stale cache lines
-    armDCacheFlush(g_mem + OFF_OUT, VIC_OUT_BYTES);
     g_stats.jobs++;
     g_stats.nsTotal += dt;
     if (dt > g_stats.nsMax)

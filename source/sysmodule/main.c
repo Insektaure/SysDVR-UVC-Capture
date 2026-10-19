@@ -60,6 +60,7 @@ volatile bool g_tapProbeRunning = true;
 static Thread g_nativeProbeThread;
 static u8 alignas(0x1000) g_nativeProbeStack[NATIVE_PROBE_STACK_SIZE];
 volatile bool g_nativeProbeRunning = true;
+extern volatile bool g_nativeStreaming;  // native_probe.c: native frames are going out
 #endif
 
 // ============================================================================
@@ -107,11 +108,28 @@ static void VideoStreamThread(void* arg)
             continue;
         }
 
+#ifdef NATIVE_PROBE
+        // the native capture sends the frames: grc:d stays idle, this thread
+        // keeps serving EP0
+        if (g_nativeStreaming) {
+            svcSleepThread(5E+6);
+            continue;
+        }
+#endif
+
         // Blocks until grc:d produces a frame - this is the loop's pacing
         if (!CaptureReadVideoFrame(&frame)) {
             svcSleepThread(16E+6);  // ~one frame
             continue;
         }
+
+#ifdef NATIVE_PROBE
+        // the native stream started while grc:d was blocked: drop this frame
+        // (a grc:d P frame in the native stream would corrupt it until the
+        // next keyframe)
+        if (g_nativeStreaming)
+            continue;
+#endif
 
         bool sent = UvcDeviceSendFrame(
             frame.Data,

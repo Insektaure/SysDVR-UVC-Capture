@@ -228,12 +228,12 @@ static struct __attribute__((packed)) {
         .bmCapabilities = 0,
         .wWidth = UVC_VIDEO_WIDTH,
         .wHeight = UVC_VIDEO_HEIGHT,
-        .dwMinBitRate = UVC_MIN_BITRATE,
-        .dwMaxBitRate = UVC_MAX_BITRATE,
-        .dwDefaultFrameInterval = UVC_FRAME_INTERVAL_30FPS,
+        .dwMinBitRate = UVC_STREAM_MIN_BITRATE,
+        .dwMaxBitRate = UVC_STREAM_MAX_BITRATE,
+        .dwDefaultFrameInterval = UVC_STREAM_FRAME_INTERVAL,
         .bFrameIntervalType = 1,
         .dwBytesPerLine = 0,        // variable for H.264
-        .dwFrameInterval1 = UVC_FRAME_INTERVAL_30FPS,
+        .dwFrameInterval1 = UVC_STREAM_FRAME_INTERVAL,
     },
     .colorMatching = {
         .bLength = sizeof(UvcColorMatchingDescriptor),
@@ -440,13 +440,13 @@ void UvcBuildDefaultProbeControl(UvcProbeCommitControl* ctrl, UvcVideoFormat for
     ctrl->bmHint = 0x0001;  // dwFrameInterval field is valid
     ctrl->bFormatIndex = 1;
     ctrl->bFrameIndex = 1;
-    ctrl->dwFrameInterval = UVC_FRAME_INTERVAL_30FPS;
+    ctrl->dwFrameInterval = UVC_STREAM_FRAME_INTERVAL;
     ctrl->wKeyFrameRate = 0;
     ctrl->wPFrameRate = 0;
     ctrl->wCompQuality = 0;
     ctrl->wCompWindowSize = 0;
     ctrl->wDelay = 0;
-    ctrl->dwMaxVideoFrameSize = UVC_H264_MAX_FRAME_SIZE;
+    ctrl->dwMaxVideoFrameSize = UVC_STREAM_MAX_FRAME_SIZE;
     ctrl->dwMaxPayloadTransferSize = 0x4000;  // 16KB chunks
     ctrl->dwClockFrequency = UVC_CLOCK_FREQUENCY;
     ctrl->bmFramingInfo = 0x03;  // Frame ID required, EOF required
@@ -1255,11 +1255,11 @@ static void _handleVsSetup(UsbDsInterface* iface, const UsbSetupPacket* setup)
         // override whatever the host asked for with our fixed parameters.
         host.bFormatIndex = 1;
         host.bFrameIndex = 1;
-        host.dwMaxVideoFrameSize = UVC_H264_MAX_FRAME_SIZE;
+        host.dwMaxVideoFrameSize = UVC_STREAM_MAX_FRAME_SIZE;
         host.dwMaxPayloadTransferSize = 0x4000;  // matches g_endpointInBuffer
         host.dwClockFrequency = UVC_CLOCK_FREQUENCY;
         if (host.dwFrameInterval == 0)
-            host.dwFrameInterval = UVC_FRAME_INTERVAL_30FPS;
+            host.dwFrameInterval = UVC_STREAM_FRAME_INTERVAL;
         memcpy(ctrl, &host, sizeof(UvcProbeCommitControl));
 
         if (cs == UVC_VS_COMMIT_CONTROL) {

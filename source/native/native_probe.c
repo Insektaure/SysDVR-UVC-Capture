@@ -20,6 +20,8 @@
 #include "donor.h"
 #include "vic.h"
 #include "vic_engine.h"
+#include "nvenc_engine.h"
+#include "../uvc/uvc_device.h"
 #include "native_probe.h"
 
 #ifdef NATIVE_PROBE
@@ -37,9 +39,15 @@
 #define MAX_BUF_BYTES     (16u * 1024 * 1024)
 #define CHUNK             0x20000      // reads go through this; dumps are written from it piece by piece
 #define DUMP_DIR          "/config/sysdvr-uvc/dump"
-#define DONOR_MB          16           // per game session: VIC buffers + a copy of the game's buffer (vic_engine.c)
+#define DONOR_MB          24           // per game session: VIC buffers + slot copy (12.5 MB), encoder arena (7.1), frame (1.5)
+#define ENCODE_QP         20           // SFT: constant QP 20 (P frames 22)
+#define H264_DUMP_FRAMES  0            // 3a wrote the first N frames to <program>.h264; off while streaming (SD writes cost latency)
 
 extern volatile bool g_nativeProbeRunning;
+
+// True while native frames go to the UVC endpoint: the video thread leaves
+// grc:d alone (main.c)
+volatile bool g_nativeStreaming = false;
 
 static u8 alignas(0x1000) g_chunk[CHUNK];
 
@@ -82,6 +90,18 @@ typedef struct {
     u32    convs, convFails, fenceTimeouts;
     u32    ivConvs;
     u64    ivReadNs, ivVicNs, ivFenceNs, ivFenceMax, ivReadBytes;
+
+    // H.264 (phase 3a) and the camera (3b)
+    u32    encFails;
+    u64    ivEncNs;
+    bool   wasStreaming;     // a new stream starts on a keyframe
+    bool   needKey;          // a send failed: the host lost a frame, restart the chain
+    u32    sent, sendFails, ivSent;
+    u64    ivSentBytes;
+    FsFile h264;
+    bool   h264Open;
+    u64    h264Off;
+    u32    h264Frames;
 } Session;
 
 static Session g_s;
@@ -272,8 +292,60 @@ static void _takeMemory(Session* s)
         bad += *(volatile u64*)(m + off) != (off ^ 0x5A5A5A5A5A5A5A5AULL);
     LOG("native: donor memory %lu MB %s\n", s->memSize >> 20, bad ? "CORRUPT" : "checked (read/write)");
     s->nextYieldCheck = _nowNs() + 1000000000ULL;
-    if (!bad && VicEngineOpen(s->mem, s->memSize, s->surf.buf_size))
-        GameDbgSetBounce(VicEngineBounce(), VicEngineBounceSize());
+    if (bad || !VicEngineOpen(s->mem, s->memSize, s->surf.buf_size))
+        return;
+    GameDbgSetBounce(VicEngineBounce(), VicEngineBounceSize());
+
+    // the encoder's arena and frame buffer after the VIC's buffers
+    const u64 arenaOff = (VicEngineBytesUsed() + 0xFFFFF) & ~0xFFFFFULL;
+    const u64 frameOff = (arenaOff + NvencArenaSize() + 0xFFFF) & ~0xFFFFULL;
+    if (frameOff + NvencFrameBufferSize() > s->memSize) {
+        LOG("native: %lu MB of donor memory: not enough for the encoder (needs %lu MB) - VIC only\n",
+            s->memSize >> 20, (frameOff + NvencFrameBufferSize() + 0xFFFFF) >> 20);
+        return;
+    }
+    u8* m8 = (u8*)s->mem;
+    NvencOpen(m8 + arenaOff, NvencArenaSize(), m8 + frameOff, NvencFrameBufferSize(), ENCODE_QP);
+}
+
+// The first H264_DUMP_FRAMES encoded frames of a session, as an Annex-B
+// elementary stream (each frame carries its SPS/PPS): ffplay plays it as is.
+// Written through g_chunk: the frame is in donor memory.
+static void _h264Append(Session* s, const u8* data, u32 len)
+{
+    if (H264_DUMP_FRAMES == 0 || s->h264Frames >= H264_DUMP_FRAMES)
+        return;
+    if (!s->h264Open) {
+        if (!_sdOpen())
+            return;
+        char path[96];
+        UvcTapPresent p = {0};
+        TapClientGetLatestPresent(&p);
+        snprintf(path, sizeof(path), DUMP_DIR "/%016lx.h264", p.program_id);
+        fsFsDeleteFile(&g_sd, path);
+        if (R_FAILED(fsFsCreateFile(&g_sd, path, 0, 0)) || R_FAILED(fsFsOpenFile(&g_sd, path, FsOpenMode_Write | FsOpenMode_Append, &s->h264))) {
+            s->h264Frames = H264_DUMP_FRAMES;  // do not retry every frame
+            return;
+        }
+        s->h264Open = true;
+        s->h264Off = 0;
+        LOG("native: writing the first %u frames to %s\n", H264_DUMP_FRAMES, path);
+    }
+    for (u32 off = 0; off < len; off += CHUNK) {
+        const u32 n = len - off < CHUNK ? len - off : CHUNK;
+        memcpy(g_chunk, data + off, n);
+        if (R_FAILED(fsFileWrite(&s->h264, s->h264Off, g_chunk, n, FsWriteOption_None))) {
+            s->h264Frames = H264_DUMP_FRAMES;
+            break;
+        }
+        s->h264Off += n;
+    }
+    if (++s->h264Frames >= H264_DUMP_FRAMES) {
+        fsFileFlush(&s->h264);
+        fsFileClose(&s->h264);
+        s->h264Open = false;
+        LOG("native: H.264 dump complete: %u frames, %lu KB\n", H264_DUMP_FRAMES, s->h264Off / 1024);
+    }
 }
 
 // The order matters: no dmnt read may use the bounce once the memory goes;
@@ -282,7 +354,9 @@ static void _releaseMemory(Session* s)
 {
     if (!s->mem)
         return;
+    g_nativeStreaming = false;
     GameDbgSetBounce(NULL, 0);
+    NvencClose();
     VicEngineClose();
     DonorRelease();
     s->mem = NULL;
@@ -336,8 +410,9 @@ static bool _readRegion(Session* s, u64 addr, const VicSource* src, u64* bytes)
     return true;
 }
 
-// One present through the VIC: copy, convert. The fence was waited on.
-static bool _convert(Session* s, const UvcTapPresent* p)
+// One present through the VIC: copy, convert (and encode, and send when a
+// camera app streams). The fence was waited on.
+static bool _convert(Session* s, const UvcTapPresent* p, bool send)
 {
     VicSource src;
     _source(s, p, &src);
@@ -348,7 +423,37 @@ static bool _convert(Session* s, const UvcTapPresent* p)
         return false;
     }
     const u64 t1 = _nowNs();
-    if (!VicEngineConvert(&src, &vicNs)) {
+    if (NvencActive()) {
+        // straight into the encoder's picture, in its 16-row block-linear layout
+        VicTarget t = { 0, 0, true };
+        NvencPictureTarget(&t.lumaAddr, &t.chromaAddr);
+        if (!VicEngineConvertTo(&src, &t, &vicNs)) {
+            s->convFails++;
+            return false;
+        }
+        const u8* frame = NULL;
+        u32 len = 0;
+        bool idr = false;
+        u64 encNs = 0;
+        if (NvencEncode(s->needKey, &frame, &len, &idr, &encNs)) {
+            s->ivEncNs += encNs;
+            s->needKey = false;
+            _h264Append(s, frame, len);
+            if (send) {
+                if (UvcDeviceSendFrame(frame, len, armTicksToNs(p->tick) / 1000000, idr)) {
+                    s->sent++;
+                    s->ivSent++;
+                    s->ivSentBytes += len;
+                } else {
+                    s->sendFails++;
+                    s->needKey = true;  // the host lost a frame: P frames after it would decode wrong
+                }
+            }
+        } else {
+            s->encFails++;
+            s->needKey = true;
+        }
+    } else if (!VicEngineConvert(&src, &vicNs)) {
         s->convFails++;
         return false;
     }
@@ -377,6 +482,16 @@ static void _endSession(Session* s, const char* why)
     VicEngineGetStats(&vs, false);
     LOG("native: VIC: %u frames converted (%u failed), %u timeouts, %u refused; fence timeouts %u%s\n",
         s->convs, s->convFails, vs.timeouts, vs.refused, s->fenceTimeouts, VicEngineWedged() ? " - ENGINE WEDGED" : "");
+    if (s->h264Open) {
+        fsFileFlush(&s->h264);
+        fsFileClose(&s->h264);
+        LOG("native: H.264 dump closed early: %u frames, %lu KB\n", s->h264Frames, s->h264Off / 1024);
+    }
+    if (NvencActive() || NvencWedged()) {
+        NvencStats es;
+        NvencGetStats(&es, false);
+        LOG("native: NVENC: %u encode failures, %u timeouts%s\n", s->encFails, es.timeouts, NvencWedged() ? " - ENGINE WEDGED" : "");
+    }
     _releaseMemory(s);
     GameDbgDetach(&s->dbg);
     memset(s, 0, sizeof(*s));
@@ -637,15 +752,32 @@ static void _logPeriodic(Session* s, const UvcTapPresent* p)
             s->ivConvs, (u64)s->ivConvs / 10, (u64)s->ivConvs % 10, s->ivFenceNs / n / 1000, s->ivFenceMax / 1000,
             s->ivReadBytes / n / 1024, s->ivReadNs / n / 1000, s->ivVicNs / n / 1000, vs.nsMax / 1000,
             s->convs, s->convFails, s->fenceTimeouts, VicEngineWedged() ? " - ENGINE WEDGED" : "");
+        if (NvencActive() || NvencWedged()) {
+            NvencStats es;
+            NvencGetStats(&es, true);
+            const u64 ne = es.frames ? es.frames : 1;
+            const u64 bits = (es.bytesI + es.bytesP) * 8;
+            LOG("native: USB last 10 s: %u frames sent (%lu KB), %u send failures in total, %u sent in total\n",
+                s->ivSent, s->ivSentBytes / 1024, s->sendFails, s->sent);
+            s->ivSent = 0;
+            s->ivSentBytes = 0;
+            LOG("native: NVENC last 10 s: %u frames (%u.%u fps), %u keyframes, encode avg %lu us (max %lu), "
+                "%lu Mbps (I avg %lu KB, P avg %lu KB), errors %u, clock %u MHz%s\n",
+                es.frames, es.frames / 10, es.frames % 10, es.idrs, es.nsTotal / ne / 1000, es.nsMax / 1000,
+                bits / 10 / 1000000, es.idrs ? es.bytesI / es.idrs / 1024 : 0,
+                es.frames > es.idrs ? es.bytesP / (es.frames - es.idrs) / 1024 : 0, es.errors,
+                es.clockHz / 1000000, NvencWedged() ? " - ENGINE WEDGED" : "");
+        }
         s->ivConvs = 0;
         s->ivReadNs = s->ivVicNs = s->ivFenceNs = s->ivFenceMax = s->ivReadBytes = 0;
+        s->ivEncNs = 0;
     }
 }
 
 void NativeProbeThread(void* arg)
 {
     (void)arg;
-    LOG("native: probe started (phase 2b-3: attach, find slots, fence, VIC to NV12 every frame, dumps)\n");
+    LOG("native: probe started (phase 3b: native H.264 720p to the UVC camera while an app streams)\n");
     DonorCleanupStale();
     Session* s = &g_s;
     memset(s, 0, sizeof(*s));
@@ -718,8 +850,22 @@ void NativeProbeThread(void* arg)
             _calibrate(s, &p);
             s->lastSeq = p.seq;
 
-            if (s->locked && VicEngineActive()) {
-                _convert(s, &p);
+            const bool streaming = UvcDeviceIsStreaming();
+            if (s->locked && NvencActive()) {
+                // encode only while a camera app streams: the game pays nothing otherwise
+                if (streaming && !s->wasStreaming) {
+                    s->needKey = true;
+                    LOG("native: a camera app is streaming - native H.264 720p from now on\n");
+                } else if (!streaming && s->wasStreaming) {
+                    LOG("native: the camera app stopped streaming\n");
+                }
+                s->wasStreaming = streaming;
+                g_nativeStreaming = streaming;
+                if (streaming)
+                    _convert(s, &p, true);
+            } else if (s->locked && VicEngineActive()) {
+                g_nativeStreaming = false;
+                _convert(s, &p, false);
             } else if (s->locked && _nowNs() >= s->nextRead) {
                 _throughputRead(s, p.slot);
                 s->nextRead = _nowNs() + READ_EVERY_NS;

@@ -37,6 +37,8 @@ bool VicEngineOpen(void* mem, u64 size, u32 slotBytes);
 // wedged. Must run before the donor memory is released.
 void VicEngineClose(void);
 bool VicEngineActive(void);
+// How much of the donor memory the engine's own buffers use (from its start).
+u64  VicEngineBytesUsed(void);
 bool VicEngineWedged(void);
 
 // Where the caller copies the game's buffer (same offsets as in the game),
@@ -47,9 +49,26 @@ u8*    VicEngineBounce(void);
 size_t VicEngineBounceSize(void);
 const u8* VicEngineOutput(void);
 
-// One job. The slot copy must hold (and be flushed for) the source's rows.
+// One job into the engine's own NV12 1280x720 pitch buffer (VicEngineOutput).
+// The slot copy must hold (and be flushed for) the source's rows.
 // *ns: submit to done.
 bool VicEngineConvert(const VicSource* src, u64* ns);
+
+// One job into another pinned buffer: NV12 1280x720, pitch-linear or NVENC's
+// input layout (16-row block-linear, chroma rows rounded up to 16). The
+// caller invalidates its cache if the CPU reads it.
+typedef struct {
+    u32 lumaAddr, chromaAddr;  // VIC device addresses (VicEnginePin), 256-aligned
+    bool blockLinear;
+} VicTarget;
+bool VicEngineConvertTo(const VicSource* src, const VicTarget* dst, u64* ns);
+
+// For the encoder: the same nvdrv session's nvmap and ctrl fds, and a pin of
+// one more buffer (cached) in the VIC channel.
+u32  VicEngineNvmapFd(void);
+u32  VicEngineCtrlFd(void);
+bool VicEngineNvmapOwn(void* cpu, u32 size, bool cacheable, u32* handle);
+bool VicEnginePin(u32 handle, u32* vicAddr);
 
 // The present's acquire fence, from vi-tap: (syncpoint id << 32) | value.
 // Polls nvhost-ctrl until every syncpoint reached it, at most timeoutNs.
