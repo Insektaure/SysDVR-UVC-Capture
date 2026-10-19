@@ -15,6 +15,74 @@ namespace ams::vitap {
 
         constinit os::SdkMutex g_lock;
         constinit UvcTapPresent g_latest = {};
+        constinit UvcTapSurface g_surface = {};
+
+        /* setPreallocatedBuffer's input parcel carries a flattened
+         * NvGraphicBuffer (libnx nvidia/graphic_buffer.h). Layout and the
+         * NvColorFormat-is-64-bit pitfall from Switch Frame Tap's
+         * applet_mitm_gbuf.hpp. */
+        struct NvSurfaceRaw {
+            u32 width, height;
+            u64 color_format;
+            u32 layout, pitch, unused_nvmap, offset, kind, block_height_log2, scan, second_field_offset;
+            u64 flags, size;
+            u32 unk[6];
+        };
+        static_assert(sizeof(NvSurfaceRaw) == 0x58 && __builtin_offsetof(NvSurfaceRaw, offset) == 0x1C && __builtin_offsetof(NvSurfaceRaw, size) == 0x38);
+
+        struct NvGraphicBufferRaw {
+            u32 hdr_unk0; s32 num_fds; s32 num_ints;
+            s32 unk0, nvmap_id;
+            u32 unk2, magic, pid, type, usage, format, ext_format, stride, total_size, num_planes, unk12;
+            NvSurfaceRaw planes[3];
+            u64 unused;
+        };
+        static_assert(sizeof(NvGraphicBufferRaw) == 0x150 && __builtin_offsetof(NvGraphicBufferRaw, nvmap_id) == 0x10 &&
+                      __builtin_offsetof(NvGraphicBufferRaw, magic) == 0x18 && __builtin_offsetof(NvGraphicBufferRaw, planes) == 0x40);
+        constexpr u32 NvGraphicBufferMagic = 0xDAFFCAFF;
+
+        bool FindGraphicBuffer(const u8 *p, size_t size, NvGraphicBufferRaw *out) {
+            if (p == nullptr || size < sizeof(NvGraphicBufferRaw)) { return false; }
+            constexpr size_t magic_off = __builtin_offsetof(NvGraphicBufferRaw, magic);
+            for (size_t i = magic_off; i + (sizeof(NvGraphicBufferRaw) - magic_off) <= size; i += 4) {
+                u32 magic;
+                std::memcpy(std::addressof(magic), p + i, sizeof(magic));
+                if (magic == NvGraphicBufferMagic) { std::memcpy(out, p + i - magic_off, sizeof(*out)); return true; }
+            }
+            return false;
+        }
+
+        /* one slot of the set; slot 0 (or an unparsed slot with a new nvmap
+         * object) starts a new set (SFT CaptureInto, v0.7.1 rules: Minecraft
+         * gives every slot its own object, so a new id alone does not) */
+        void RecordSurface(const sm::MitmProcessInfo &ci, s32 slot_arg, const NvGraphicBufferRaw &gb) {
+            if (gb.num_planes == 0) { return; }
+            const NvSurfaceRaw &p0 = gb.planes[0];
+            std::scoped_lock lk(g_lock);
+            UvcTapSurface &s = g_surface;
+            const bool new_set = slot_arg == 0 || s.process_id != ci.process_id.value ||
+                                 (slot_arg < 0 && static_cast<u32>(gb.nvmap_id) != s.slot_nvmap[0]);
+            if (new_set) {
+                const u32 gen = s.generation + 1;
+                s = {};
+                s.generation = gen;
+                s.process_id = ci.process_id.value;
+            }
+            const u32 slot = (slot_arg >= 0 && slot_arg < 8) ? static_cast<u32>(slot_arg) : s.num_slots;
+            if (slot < 8) {
+                s.slot_offset[slot] = p0.offset;
+                s.slot_nvmap[slot]  = static_cast<u32>(gb.nvmap_id);
+                if (slot + 1 > s.num_slots) { s.num_slots = slot + 1; }
+            }
+            s.color_format = p0.color_format;
+            s.width        = p0.width;
+            s.height       = p0.height;
+            s.stride_px    = p0.pitch / 4;
+            s.block_h_log2 = p0.block_height_log2;
+            s.layout       = p0.layout;
+            s.kind         = p0.kind;
+            s.buf_size     = gb.total_size;
+        }
         constinit os::SystemEventType g_present_event = {};
 
         /* The parcel parsers follow Switch Frame Tap's applet_mitm_service.cpp
@@ -94,7 +162,17 @@ namespace ams::vitap {
     void OnBinderTransaction(const sm::MitmProcessInfo &ci, u32 code, const void *parcel, size_t size) {
         const u8 *p = static_cast<const u8 *>(parcel);
         if (code == Code_SetPreallocatedBuffer) {
-            if (IsRunningApplication(ci.process_id)) { NoteSlot(ci, ParseSlot(p, size)); }
+            /* a game registers its buffers right at launch, possibly before
+             * the 100 ms watcher has seen its pid: accept while it is unknown
+             * (only application-range processes are wrapped at all) */
+            const u64 ap = g_app_pid.load(std::memory_order_relaxed);
+            if (ap == 0 || ap == ci.process_id.value) {
+                const s32 slot = ParseSlot(p, size);
+                NoteSlot(ci, slot);
+                /* 0x150 bytes on the stack, a few times per game launch */
+                NvGraphicBufferRaw gb;
+                if (FindGraphicBuffer(p, size, std::addressof(gb))) { RecordSurface(ci, slot, gb); }
+            }
             return;
         }
         if (code != Code_QueueBuffer) { return; }
@@ -125,6 +203,11 @@ namespace ams::vitap {
         *out = g_latest;
     }
 
+    void GetSurface(UvcTapSurface *out) {
+        std::scoped_lock lk(g_lock);
+        *out = g_surface;
+    }
+
     void GetStats(UvcTapStats *out) {
         out->app_pid          = g_app_pid.load(std::memory_order_relaxed);
         out->displays_wrapped = g_counters.displays.load(std::memory_order_relaxed);
@@ -145,6 +228,7 @@ namespace ams::vitap {
 
         void AppWatchThread(void *) {
             u64 last_pid = ~UINT64_C(0), last_presents = 0, last_log_ms = 0;
+            u32 last_gen = 0, last_slots = 0;
             for (;;) {
                 os::ProcessId pid{};
                 const u64 now = R_SUCCEEDED(pm::dmnt::GetApplicationProcessId(std::addressof(pid))) ? pid.value : 0;
@@ -155,6 +239,18 @@ namespace ams::vitap {
                 if (now != last_pid) {
                     LogLine("application pid %llu", static_cast<unsigned long long>(now));
                     last_pid = now;
+                }
+                {
+                    UvcTapSurface sf;
+                    GetSurface(std::addressof(sf));
+                    if (sf.process_id != 0 && (sf.generation != last_gen || sf.num_slots != last_slots)) {
+                        LogLine("surface gen %u pid %llu: %ux%u stride %u px, block 2^%u, layout %u, kind 0x%x, format %#llx, %u slot(s) of %u B, offsets 0x%x/0x%x/0x%x, nvmap %u/%u/%u",
+                                sf.generation, static_cast<unsigned long long>(sf.process_id), sf.width, sf.height, sf.stride_px, sf.block_h_log2,
+                                sf.layout, sf.kind, static_cast<unsigned long long>(sf.color_format), sf.num_slots, sf.buf_size,
+                                sf.slot_offset[0], sf.slot_offset[1], sf.slot_offset[2], sf.slot_nvmap[0], sf.slot_nvmap[1], sf.slot_nvmap[2]);
+                        last_gen = sf.generation;
+                        last_slots = sf.num_slots;
+                    }
                 }
                 /* every 10 s while frames come in: rate, last record, counters.
                  * No %f: newlib's float formatting allocates, and a stratosphere

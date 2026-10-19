@@ -60,8 +60,10 @@ static void _initFileLogging(void)
 {
     if (R_SUCCEEDED(fsOpenSdCardFileSystem(&g_sdCard))) {
         g_sdMounted = true;
-        // Truncate existing log
-        fsFsDeleteFile(&g_sdCard, "/logfile.txt");
+        // Keep the previous start's log (a toggle in ovlSysmodules is a
+        // restart: the kill tests need what happened before it)
+        fsFsDeleteFile(&g_sdCard, "/logfile.prev.txt");
+        fsFsRenameFile(&g_sdCard, "/logfile.txt", "/logfile.prev.txt");
         fsFsCreateFile(&g_sdCard, "/logfile.txt", 0, 0);
     }
 }
@@ -186,6 +188,14 @@ void CoreExit(void)
 #endif
 
     g_coreInitialized = false;
+}
+
+bool CoreHasService(const char* name)
+{
+    u8 has = 0;
+    SmServiceName sn = smEncodeName(name);
+    Result rc = tipcDispatchInOut(smGetServiceSessionTipc(), 65100, sn, has);
+    return R_SUCCEEDED(rc) && (has & 1);
 }
 
 // Thread creation failure is unrecoverable for this sysmodule: R_THROW

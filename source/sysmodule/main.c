@@ -5,6 +5,7 @@
 #include "../capture.h"
 #include "../uvc/uvc_device.h"
 #include "../tap_client.h"
+#include "../native/native_probe.h"
 
 // ============================================================================
 // libnx Sysmodule Configuration
@@ -50,6 +51,15 @@ static volatile bool g_running = true;
 static Thread g_tapProbeThread;
 static u8 alignas(0x1000) g_tapProbeStack[TAP_PROBE_STACK_SIZE];
 volatile bool g_tapProbeRunning = true;
+#endif
+
+#ifdef NATIVE_PROBE
+// Phase 2a: attach to the game, find its swapchain, read and dump frames
+#define NATIVE_PROBE_STACK_SIZE (0x4000 + LOGGING_STACK_BOOST)
+#define NATIVE_PROBE_PRIORITY   0x3B
+static Thread g_nativeProbeThread;
+static u8 alignas(0x1000) g_nativeProbeStack[NATIVE_PROBE_STACK_SIZE];
+volatile bool g_nativeProbeRunning = true;
 #endif
 
 // ============================================================================
@@ -268,6 +278,11 @@ int main(int argc, char* argv[])
                  g_tapProbeStack, TAP_PROBE_STACK_SIZE,
                  TAP_PROBE_PRIORITY);
 #endif
+#ifdef NATIVE_PROBE
+    LaunchThread(&g_nativeProbeThread, NativeProbeThread, NULL,
+                 g_nativeProbeStack, NATIVE_PROBE_STACK_SIZE,
+                 NATIVE_PROBE_PRIORITY);
+#endif
 
     LOG("SysDVR-UVC running (video + audio)\n");
 
@@ -282,6 +297,10 @@ int main(int argc, char* argv[])
 #ifdef TAP_PROBE
     g_tapProbeRunning = false;
     JoinThread(&g_tapProbeThread);
+#endif
+#ifdef NATIVE_PROBE
+    g_nativeProbeRunning = false;
+    JoinThread(&g_nativeProbeThread);
 #endif
     UvcDeviceExit();
 

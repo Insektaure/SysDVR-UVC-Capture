@@ -10,7 +10,7 @@
 #include <stdint.h>
 
 #define UVCTAP_SERVICE_NAME "uvctap"
-#define UVCTAP_VERSION      1
+#define UVCTAP_VERSION      2
 
 // Program id of vi-tap (atmosphere/contents/<id>/)
 #define UVCTAP_PROGRAM_ID   0x00FF0000A53BB667ull
@@ -20,6 +20,7 @@ enum {
     UvcTapCmd_GetPresentEvent  = 1,  // () -> copy handle: readable event, signalled on each present
     UvcTapCmd_GetLatestPresent = 2,  // () -> UvcTapPresent
     UvcTapCmd_GetStats         = 3,  // () -> UvcTapStats
+    UvcTapCmd_GetSurface       = 4,  // () -> UvcTapSurface (v2)
 };
 
 // The application's last queueBuffer (IGraphicBufferProducer code 7).
@@ -47,10 +48,31 @@ typedef struct {
     uint64_t other_presents;    // queueBuffer from a wrapped non-application process
 } UvcTapStats;
 
+// The application's swapchain, from setPreallocatedBuffer (code 14): one
+// flattened NvGraphicBuffer per slot. Slot 0 starts a new set.
+typedef struct {
+    uint64_t process_id;    // 0 = nothing recorded yet
+    uint64_t color_format;  // plane 0 NvColorFormat (A8B8G8R8 = 0x100532120)
+    uint32_t generation;    // bumped when a new set starts
+    uint32_t num_slots;
+    uint32_t width;         // plane 0, pixels
+    uint32_t height;
+    uint32_t stride_px;     // plane 0 pitch / 4
+    uint32_t block_h_log2;  // GOBs per block, log2 (block-linear)
+    uint32_t layout;        // NvLayout: 3 = block-linear
+    uint32_t kind;          // NvKind (0xFE = Generic_16BX2)
+    uint32_t buf_size;      // one buffer's total size, bytes
+    uint32_t reserved;
+    uint32_t slot_offset[8];// plane 0 offset in its nvmap object, per slot
+    uint32_t slot_nvmap[8]; // nvmap object id, per slot (differs: one object per slot)
+} UvcTapSurface;
+
 #ifdef __cplusplus
+static_assert(sizeof(UvcTapSurface) == 120, "UvcTapSurface layout is part of the protocol");
 static_assert(sizeof(UvcTapPresent) == 96, "UvcTapPresent layout is part of the protocol");
 static_assert(sizeof(UvcTapStats) == 48, "UvcTapStats layout is part of the protocol");
 #else
+_Static_assert(sizeof(UvcTapSurface) == 120, "UvcTapSurface layout is part of the protocol");
 _Static_assert(sizeof(UvcTapPresent) == 96, "UvcTapPresent layout is part of the protocol");
 _Static_assert(sizeof(UvcTapStats) == 48, "UvcTapStats layout is part of the protocol");
 #endif

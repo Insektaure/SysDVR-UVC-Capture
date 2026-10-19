@@ -1,26 +1,15 @@
 #include "core.h"
 #include "tap_client.h"
 
-#define TAP_CMD_ATMOSPHERE_HAS_SERVICE 65100
-
 static Service g_tapService;
 static Event g_presentEvent;
 static bool g_connected = false;
-
-static bool _tapRegistered(void)
-{
-    u8 has = 0;
-    SmServiceName name = smEncodeName(UVCTAP_SERVICE_NAME);
-    Result rc = tipcDispatchInOut(smGetServiceSessionTipc(),
-                                  TAP_CMD_ATMOSPHERE_HAS_SERVICE, name, has);
-    return R_SUCCEEDED(rc) && (has & 1);
-}
 
 Result TapClientConnect(void)
 {
     if (g_connected)
         return 0;
-    if (!_tapRegistered())
+    if (!CoreHasService(UVCTAP_SERVICE_NAME))
         return MAKERESULT(Module_Libnx, LibnxError_NotFound);
 
     R_RET_ON_FAIL(smGetService(&g_tapService, UVCTAP_SERVICE_NAME));
@@ -76,6 +65,11 @@ Result TapClientGetLatestPresent(UvcTapPresent* out)
 Result TapClientGetStats(UvcTapStats* out)
 {
     return serviceDispatchOut(&g_tapService, UvcTapCmd_GetStats, *out);
+}
+
+Result TapClientGetSurface(UvcTapSurface* out)
+{
+    return serviceDispatchOut(&g_tapService, UvcTapCmd_GetSurface, *out);
 }
 
 // ============================================================================

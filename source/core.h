@@ -61,3 +61,10 @@ void JoinThread(Thread* t);
  * Get the console serial number
  */
 const char* CoreGetSerialNumber(void);
+
+/**
+ * Whether a service is registered, without blocking: smGetService on an
+ * unregistered name waits forever under Atmosphère (sm defers the request
+ * until the service registers). Uses Atmosphère's AtmosphereHasService.
+ */
+bool CoreHasService(const char* name);

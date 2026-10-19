@@ -17,6 +17,12 @@ namespace ams::vitap {
         out.SetValue(r);
     }
 
+    void TapService::GetSurface(sf::Out<UvcTapSurface> out) {
+        UvcTapSurface s;
+        vitap::GetSurface(std::addressof(s));
+        out.SetValue(s);
+    }
+
     void TapService::GetStats(sf::Out<UvcTapStats> out) {
         UvcTapStats s;
         vitap::GetStats(std::addressof(s));

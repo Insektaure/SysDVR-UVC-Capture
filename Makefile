@@ -19,7 +19,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #TARGET		:=	sys-dvr-uvc
 TARGET		:=	exefs
 BUILD		:=	build
-SOURCES		:=	source source/sysmodule source/uvc
+SOURCES		:=	source source/sysmodule source/uvc source/native
 DATA		:=	data
 INCLUDES	:=	include
 
