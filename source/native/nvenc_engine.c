@@ -441,6 +441,27 @@ bool NvencEncode(bool idr, const u8** data, u32* len, bool* isIdr, u64* ns)
     return true;
 }
 
+bool NvencEncodeBlack(u8* out, u32 max, u32* len)
+{
+    if (!g_open || g_wedged)
+        return false;
+    // a uniform picture needs no layout: block-linear or not, every byte is
+    // the same value per plane
+    memset(g_a + A_CUR, 16, A_LUMA);
+    memset(g_a + A_CUR_UV, 128, A_CHROMA);
+    armDCacheFlush(g_a + A_CUR, A_CUR_UV + A_CHROMA - A_CUR);
+    const u8* data = NULL;
+    u32 n = 0;
+    bool idr = false;
+    const bool ok = NvencEncode(true, &data, &n, &idr, NULL) && idr && n <= max;
+    if (ok) {
+        memcpy(out, data, n);
+        *len = n;
+    }
+    g_needIdr = true;  // the next real frame starts its own chain
+    return ok;
+}
+
 void NvencGetStats(NvencStats* out, bool reset)
 {
     *out = g_stats;

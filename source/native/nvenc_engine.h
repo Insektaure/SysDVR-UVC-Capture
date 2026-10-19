@@ -42,6 +42,11 @@ void NvencPictureTarget(u32* lumaAddr, u32* chromaAddr);
 // included, valid until the next call. *isIdr: what it was.
 bool NvencEncode(bool idr, const u8** data, u32* len, bool* isIdr, u64* ns);
 
+// Encodes a black keyframe (Y 16, U/V 128 - BT.709 limited black) into out,
+// SPS/PPS included: what the camera sends between games, so the stream never
+// goes silent. The next NvencEncode starts a new chain from a keyframe.
+bool NvencEncodeBlack(u8* out, u32 max, u32* len);
+
 typedef struct {
     u32 frames, idrs, errors, timeouts;
     u64 bytesI, bytesP, nsTotal, nsMax;

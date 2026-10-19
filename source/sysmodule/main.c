@@ -225,8 +225,12 @@ void __appInit(void)
     CoreEarlyLog();
 
     // Wait out the system boot (grc:d and usb:ds are not usable right after
-    // boot2 launches us; probing them too early fails or fatals)
-    svcSleepThread(20E+9);
+    // boot2 launches us; probing them too early fails or fatals). Started
+    // later - turned on from ovlSysmodules - everything has long been ready:
+    // no wait, the camera comes up at once.
+    const u64 uptimeNs = armTicksToNs(armGetSystemTick());
+    if (uptimeNs < 60E+9)
+        svcSleepThread(20E+9);
 
     // hosversionSet is required for the HOS 5.0+ checks in usbDs setup
     rc = setsysInitialize();

@@ -216,8 +216,9 @@ void CoreEarlyLog(void)
 #endif
     u64 pid = 0;
     svcGetProcessId(&pid, CUR_PROCESS_HANDLE);
-    LOG("\n==== [%lus] process %lu started, waiting 20 s before init\n",
-        armTicksToNs(armGetSystemTick()) / 1000000000ULL, pid);
+    LOG("\n==== [%lus] process %lu started%s\n",
+        armTicksToNs(armGetSystemTick()) / 1000000000ULL, pid,
+        armTicksToNs(armGetSystemTick()) < 60000000000ULL ? ", boot: waiting 20 s before init" : "");
     (void)pid;
 }
 

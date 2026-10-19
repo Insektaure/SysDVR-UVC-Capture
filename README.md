@@ -48,7 +48,8 @@ make -j DEFINES="-DFILE_LOGGING"
    on the SD card (create the directory if needed)
 2. Optionally copy `toolbox.json` file & `flags` folder to the same directory
 3. Reboot. The sysmodule waits ~20 seconds after boot before taking over
-   USB, so the device appears a little after the HOME menu does.
+   USB, so the device appears a little after the HOME menu does. Turned on
+   later (ovlSysmodules), it starts at once.
 
 ## Usage
 

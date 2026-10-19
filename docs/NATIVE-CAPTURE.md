@@ -499,8 +499,10 @@ if none is, it waits for the oldest (the GPU finishes them in order) - SFT
 M96. Measured before: a GPU-heavy game that queues frames ahead (01003ec027cc8000)
 cost ~39 ms of fence wait per frame, ~12 fps. A light game is unchanged: the
 previous present is already encoded, so the newest is the only candidate.
-Through dmnt:cht, at most one encode per 33 ms. A copy the game drew over is
-re-read once, else skipped (8 samples, one per block row). SysDVR-UVC still
+Through dmnt:cht, no rate cap any more (it was one encode per 33 ms): as fast
+as the slower copies allow. A copy the game drew over is re-read once, else skipped (8 samples, one per block row). Startup: the 20 s wait
+for the system to come up only applies in the first minute after boot;
+turned on later from ovlSysmodules, SysDVR-UVC starts at once. SysDVR-UVC still
 works with a v2 vi-tap (latest present only) until the next reboot.
 
 Also fixed after the game-switch tests: a stale "game exited" from the debug

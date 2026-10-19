@@ -96,7 +96,6 @@ typedef struct {
     bool   wasStreaming;     // a new stream starts on a keyframe
     u32    commits;          // UvcDeviceCommitCount at the last frame: a new consumer wants a keyframe
     u64    lastEncSeq;       // the present encoded last
-    u64    lastEncNs;        // when (through dmnt:cht: at most 30 a second)
     u32    ivPickReady, ivPickWaited, ivSkipped;
     u32    torn, rereads;    // copies the game changed under us
     u64    nextSurfaceCheck; // the game may make new frame buffers mid-session
@@ -114,6 +113,18 @@ static Session g_s;
 // Back-off for sessions that end right after starting (a bug, or a game we
 // cannot handle): never cycle the donor and the engines in a tight loop
 static u64 g_retryAtNs = 0, g_retryDelayNs = 0;
+
+// Keep-alive: an app with the camera open never sees the stream go silent.
+// Frames that stop for seconds (between games, HOME, a loading screen) and
+// come back with a timestamp seconds later make players hold the last frame
+// as if it lasted that long and stop reading (ffplay had to be killed between
+// games). After FILLER_NS without a frame: during a game, the last picture
+// encoded again (a tiny P frame); between games, a black keyframe made once.
+#define FILLER_NS 200000000ULL
+static u8 g_black[0x8000];
+static u32 g_blackLen = 0;
+static u64 g_lastSentNs = 0;
+static u32 g_fillers = 0;
 
 // When the running application last changed: how long a game switch keeps
 // the camera without frames (logged with the first frame of a session)
@@ -320,7 +331,10 @@ static void _takeMemory(Session* s)
         return;
     }
     u8* m8 = (u8*)s->mem;
-    NvencOpen(m8 + arenaOff, NvencArenaSize(), m8 + frameOff, NvencFrameBufferSize(), ENCODE_QP);
+    if (NvencOpen(m8 + arenaOff, NvencArenaSize(), m8 + frameOff, NvencFrameBufferSize(), ENCODE_QP) && !g_blackLen) {
+        if (NvencEncodeBlack(g_black, sizeof(g_black), &g_blackLen))
+            LOG("native: black keyframe for the gaps between games: %u B\n", g_blackLen);
+    }
 }
 
 // The first H264_DUMP_FRAMES encoded frames of a session, as an Annex-B
@@ -539,6 +553,7 @@ static bool _convert(Session* s, const UvcTapPresent* p, bool send)
             _h264Append(s, frame, len);
             if (send) {
                 if (UvcDeviceSendFrame(frame, len, armTicksToNs(p->tick) / 1000000, idr)) {
+                    g_lastSentNs = _nowNs();
                     if (s->sent == 0) {
                         const u64 now = _nowNs();
                         LOG("native: first frame sent (%s, %u KB): %lu ms after the game appeared, %lu ms after attaching\n",
@@ -875,8 +890,8 @@ static void _logPeriodic(Session* s, const UvcTapPresent* p)
             const u64 ne = es.frames ? es.frames : 1;
             const u64 bits = (es.bytesI + es.bytesP) * 8;
             LOG("native: USB last 10 s: %u frames sent (%lu KB), %u send failures in total, %u sent in total; "
-                "copies re-read %u, torn and skipped %u\n",
-                s->ivSent, s->ivSentBytes / 1024, s->sendFails, s->sent, s->rereads, s->torn);
+                "copies re-read %u, torn and skipped %u; keep-alive frames %u\n",
+                s->ivSent, s->ivSentBytes / 1024, s->sendFails, s->sent, s->rereads, s->torn, g_fillers);
             s->ivSent = 0;
             s->ivSentBytes = 0;
             LOG("native: NVENC last 10 s: %u frames (%u.%u fps), %u keyframes, encode avg %lu us (max %lu), "
@@ -892,6 +907,34 @@ static void _logPeriodic(Session* s, const UvcTapPresent* p)
         s->ivPickReady = s->ivPickWaited = s->ivSkipped = 0;
         s->ivEncNs = 0;
     }
+}
+
+static void _filler(Session* s)
+{
+    if (!UvcDeviceIsStreaming() || _nowNs() - g_lastSentNs < FILLER_NS)
+        return;
+    const u8* frame = NULL;
+    u32 len = 0;
+    bool idr = false;
+    if (s->attached && s->locked && NvencActive() && s->convs > 0 && !s->needKey) {
+        // the encoder's picture still holds the last frame: the same again
+        if (!NvencEncode(false, &frame, &len, &idr, NULL))
+            return;
+    } else if (g_blackLen) {
+        frame = g_black;
+        len = g_blackLen;
+        idr = true;
+        // the decoder's reference is black now: real frames restart from a
+        // keyframe
+        s->needKey = true;
+    } else {
+        return;
+    }
+    g_lastSentNs = _nowNs();  // even if it fails: a stalled host is not retried at once
+    if (UvcDeviceSendFrame(frame, len, g_lastSentNs / 1000000, idr))
+        g_fillers++;
+    else
+        s->needKey = true;
 }
 
 void NativeCaptureThread(void* arg)
@@ -914,7 +957,8 @@ void NativeCaptureThread(void* arg)
         }
 
         Event* ev = TapClientPresentEvent();
-        bool woke = R_SUCCEEDED(eventWait(ev, 1000000000ULL));
+        // while an app streams, wake at least as often as the keep-alive needs
+        bool woke = R_SUCCEEDED(eventWait(ev, UvcDeviceIsStreaming() ? FILLER_NS / 2 : 1000000000ULL));
         if (woke)
             eventClear(ev);
 
@@ -1004,8 +1048,8 @@ void NativeCaptureThread(void* arg)
             if (s->locked && NvencActive()) {
                 if (streaming && !s->wasStreaming) {
                     s->needKey = true;  // a new stream starts on a keyframe
-                    LOG("native: a camera app is streaming - native H.264 720p%s from now on\n",
-                        s->dbg.dmnt ? " at up to 30 fps (read through dmnt:cht)" : "");
+                    LOG("native: a camera app is streaming - native H.264 720p from now on%s\n",
+                        s->dbg.dmnt ? " (read through dmnt:cht: slower copies)" : "");
                 } else if (!streaming && s->wasStreaming) {
                     LOG("native: the camera app stopped streaming\n");
                 }
@@ -1018,13 +1062,12 @@ void NativeCaptureThread(void* arg)
                     s->needKey = true;
                 }
             }
-            // Through dmnt:cht a copy takes ~20 ms (5x slower than direct,
-            // SFT): at most 30 frames a second keeps them whole
-            const bool due = !s->dbg.dmnt || _nowNs() - s->lastEncNs >= 33000000ULL;
+            // As fast as the copies allow, on either route: through dmnt:cht
+            // a copy is slower (7-27 ms for 3.75 MB, direct 2.2 ms), and one
+            // the game drew over is re-read or skipped (_changedSinceRead)
             UvcTapPresent pick;
-            if (encodeable && due && _pickPresent(s, &p, &pick)) {
+            if (encodeable && _pickPresent(s, &p, &pick)) {
                 s->lastEncSeq = pick.seq;
-                s->lastEncNs = _nowNs();
                 _convert(s, &pick, true);
             }
 #if NATIVE_DEBUG
@@ -1047,6 +1090,8 @@ void NativeCaptureThread(void* arg)
                 _dump(s, &p);
         }
 #endif
+
+        _filler(s);
 
         if (s->mem && _nowNs() >= s->nextYieldCheck) {
             s->nextYieldCheck = _nowNs() + 1000000000ULL;
