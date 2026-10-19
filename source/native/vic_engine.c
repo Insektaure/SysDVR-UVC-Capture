@@ -39,6 +39,7 @@ static u8* g_slotCpu[2] = { NULL, NULL };
 static bool g_jobPending = false;
 static u32 g_jobFence = 0;
 static u64 g_jobT0 = 0;
+static u32 g_jobAhead = 0;   // syncpoint increments queued before ours at submit (the compositor's)
 static VicEngineStats g_stats;
 
 static bool _nvmapOwn(void* cpu, u32 size, bool cacheable, u32* handle)
@@ -344,8 +345,17 @@ bool VicEngineSubmitTo(const VicSource* src, const VicTarget* dst)
     g_jobFence = sb[12];
     g_jobT0 = t0;
     g_jobPending = true;
+    // The VIC syncpoint is shared with the compositor: the submit returns the
+    // syncpoint's new maximum, the value now is what has completed - the gap,
+    // less our own increment, is work queued ahead of ours
+    struct { u32 id, value; } r = { g_syncpt, 0 };
+    u32 e = 0;
+    g_jobAhead = R_SUCCEEDED(NvdrvIoctl(g_ctrlFd, NVHOST_IOC_CTRL_SYNCPT_READ, &r, sizeof(r), &e)) && !e &&
+                 (s32)(g_jobFence - r.value) > 1 ? g_jobFence - r.value - 1 : 0;
     return true;
 }
+
+u32 VicEngineJobAhead(void) { return g_jobAhead; }
 
 bool VicEngineJobPending(void) { return g_jobPending; }
 

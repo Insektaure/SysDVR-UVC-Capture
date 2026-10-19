@@ -76,6 +76,9 @@ bool VicEngineConvertTo(const VicSource* src, const VicTarget* dst, u64* ns);
 // submit wedges the engine (JobWait returns false).
 bool VicEngineSubmitTo(const VicSource* src, const VicTarget* dst);
 bool VicEngineJobPending(void);
+// Of the job last submitted: syncpoint increments queued ahead of it at
+// submit (the VIC syncpoint is shared with the compositor).
+u32  VicEngineJobAhead(void);
 bool VicEngineJobWait(u64* ns, u64* blockedNs);
 
 // For the encoder: the same nvdrv session's nvmap and ctrl fds, and a pin of

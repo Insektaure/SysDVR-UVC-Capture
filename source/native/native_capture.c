@@ -107,6 +107,13 @@ typedef struct {
     u32    ivFences, ivCopies;
     u64    ivVicWaitNs;      // of ivVicNs, what the loop spent waiting for the VIC
     u32    ivOverlapped, ivAlone;  // pipelined jobs collected after the next copy / with nothing to overlap
+    // the VIC queue theory: job times (one after the other only: exact) by
+    // compositor work queued ahead at submit, and by the game's presents the
+    // GPU had not finished at pick (0, 1, 2+)
+    u32    pickBacklog, jobBacklog, jobAhead;
+    bool   jobTimed;
+    u32    qN[3], bN[3];
+    u64    qNs[3], bNs[3];
 
     // pipelining (TRIAL_*)
     bool   pipe;             // copy the next frame while the VIC converts this one
@@ -544,6 +551,7 @@ static bool _pickPresent(Session* s, const UvcTapPresent* latest, UvcTapPresent*
         }
         oldest = (s32)i;
     }
+    s->pickBacklog = pick >= 0 ? (u32)pick : 0;  // newer presents than the pick, all unfinished
     if (pick >= 0) {
         s->ivPickReady++;
     } else if (oldest >= 0) {
@@ -585,6 +593,13 @@ static void _finish(Session* s)
     s->ivConvs++;
     s->ivVicNs += vicNs;
     s->ivVicWaitNs += waitNs;
+    if (s->jobTimed) {
+        const u32 q = s->jobAhead > 2 ? 2 : s->jobAhead, b = s->jobBacklog > 2 ? 2 : s->jobBacklog;
+        s->qN[q]++;
+        s->qNs[q] += vicNs;
+        s->bN[b]++;
+        s->bNs[b] += vicNs;
+    }
     const UvcTapPresent* p = &s->job;
     const u8* frame = NULL;
     u32 len = 0;
@@ -661,6 +676,9 @@ static bool _convert(Session* s, const UvcTapPresent* p)
     s->pending = true;
     s->job = *p;
     s->jobCopy = src.copy;
+    s->jobAhead = VicEngineJobAhead();
+    s->jobBacklog = s->pickBacklog;
+    s->jobTimed = !s->pipe;  // collected at once: its time is the job's
     if (!s->pipe)
         _finish(s);
     return s->pending;
@@ -1062,11 +1080,17 @@ static void _logPeriodic(Session* s, const UvcTapPresent* p)
                 es.frames > es.idrs ? es.bytesP / (es.frames - es.idrs) / 1024 : 0, es.errors,
                 es.clockHz / 1000000, NvencWedged() ? " - ENGINE WEDGED" : "");
         }
-#if LOGGING_ENABLED
-        // read only: why the VIC takes 20 ms in some games and 0.6 in others
-        LOG("native: clocks now: VIC %u MHz, EMC %u MHz, GPU %u MHz\n", NvencPcvClockHz(0x4000002Fu) / 1000000,
-            NvencPcvClockHz(0x40000039u) / 1000000, NvencPcvClockHz(0x40000002u) / 1000000);
-#endif
+#define AVG(ns, n) ((n) ? (ns) / (n) / 1000 : 0)
+        LOG("native: VIC queue (jobs collected at once): compositor work ahead at submit 0: %u jobs avg %lu us | "
+            "1: %u avg %lu us | 2+: %u avg %lu us; game frames the GPU had not finished 0: %u avg %lu us | "
+            "1: %u avg %lu us | 2+: %u avg %lu us\n",
+            s->qN[0], AVG(s->qNs[0], s->qN[0]), s->qN[1], AVG(s->qNs[1], s->qN[1]), s->qN[2], AVG(s->qNs[2], s->qN[2]),
+            s->bN[0], AVG(s->bNs[0], s->bN[0]), s->bN[1], AVG(s->bNs[1], s->bN[1]), s->bN[2], AVG(s->bNs[2], s->bN[2]));
+#undef AVG
+        memset(s->qN, 0, sizeof(s->qN));
+        memset(s->bN, 0, sizeof(s->bN));
+        memset(s->qNs, 0, sizeof(s->qNs));
+        memset(s->bNs, 0, sizeof(s->bNs));
         s->ivConvs = 0;
         s->ivReadNs = s->ivVicNs = s->ivFenceNs = s->ivFenceMax = s->ivReadBytes = 0;
         s->ivFences = s->ivCopies = 0;
