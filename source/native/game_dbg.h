@@ -70,5 +70,7 @@ typedef struct {
 
 void DebugPumpStart(Handle dbg);
 void DebugPumpStop(void);
+// The game exited (or the handle broke) - only while a pump runs: through
+// dmnt:cht there is none, and the application change says it instead.
 bool DebugPumpGone(void);
 void DebugPumpGetStats(DebugPumpStats* out);

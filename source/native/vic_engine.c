@@ -358,6 +358,20 @@ bool VicEngineWaitFence(u32 count, const u64* fence, u64 timeoutNs, u64* waitedN
     return ok;
 }
 
+bool VicEngineFenceReached(u32 count, const u64* fence)
+{
+    if (!g_open || count == 0 || count > 4)
+        return true;
+    for (u32 k = 0; k < count; k++) {
+        const u32 id = (u32)(fence[k] >> 32), want = (u32)fence[k];
+        if (id == 0xFFFFFFFFu || id >= 192)
+            continue;
+        if (!_syncptReached(id, want))
+            return false;
+    }
+    return true;
+}
+
 void VicEngineGetStats(VicEngineStats* out, bool reset)
 {
     *out = g_stats;

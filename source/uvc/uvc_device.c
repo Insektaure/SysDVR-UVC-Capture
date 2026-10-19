@@ -23,6 +23,11 @@ typedef struct __attribute__((packed)) {
 // Static buffers - must be aligned for USB DMA
 // ============================================================================
 
+// Commits so far: each one is a host (re)starting the stream - an app opened
+// the camera, or reopened it without the device being re-plugged. Read by
+// the encoder, which must then send a keyframe.
+static volatile u32 g_commits = 0;
+
 static u8 alignas(0x1000) g_videoBuffer[0x60000];       // ~384KB for video frames
 static u8 alignas(0x1000) g_controlBuffer[0x1000];     // 4KB for VS control transfers
 static u8 alignas(0x1000) g_vcControlBuffer[0x1000];   // 4KB for VC control transfers (separate from VS)
@@ -930,6 +935,11 @@ bool UvcDeviceIsConnected(void)
     return false;
 }
 
+u32 UvcDeviceCommitCount(void)
+{
+    return g_commits;
+}
+
 bool UvcDeviceIsStreaming(void)
 {
     return g_uvcCtx.state == UVC_STATE_STREAMING;
@@ -1265,6 +1275,7 @@ static void _handleVsSetup(UsbDsInterface* iface, const UsbSetupPacket* setup)
         if (cs == UVC_VS_COMMIT_CONTROL) {
             g_uvcCtx.activeFormat = UVC_FORMAT_H264;
             g_uvcCtx.state = UVC_STATE_STREAMING;
+            g_commits++;  // a (new) consumer: the next frame must be a keyframe
             g_uacCtx.streaming = g_uacCtx.initialized;
             LOG("Commit received - streaming started\n");
         } else {

@@ -4,6 +4,7 @@
 static Service g_tapService;
 static Event g_presentEvent;
 static bool g_connected = false;
+static u32 g_version = 0;
 
 Result TapClientConnect(void)
 {
@@ -16,10 +17,12 @@ Result TapClientConnect(void)
 
     u32 version = 0;
     Result rc = serviceDispatchOut(&g_tapService, UvcTapCmd_GetVersion, version);
-    if (R_SUCCEEDED(rc) && version != UVCTAP_VERSION) {
-        LOG("uvctap: protocol %u, expected %u\n", version, UVCTAP_VERSION);
+    // v2 (no present history) still works: an older vi-tap until the next reboot
+    if (R_SUCCEEDED(rc) && (version < 2 || version > UVCTAP_VERSION)) {
+        LOG("uvctap: protocol %u, expected 2..%u\n", version, UVCTAP_VERSION);
         rc = MAKERESULT(Module_Libnx, LibnxError_IncompatSysVer);
     }
+    g_version = version;
 
     Handle h = INVALID_HANDLE;
     if (R_SUCCEEDED(rc)) {
@@ -65,6 +68,22 @@ Result TapClientGetLatestPresent(UvcTapPresent* out)
 Result TapClientGetStats(UvcTapStats* out)
 {
     return serviceDispatchOut(&g_tapService, UvcTapCmd_GetStats, *out);
+}
+
+u32 TapClientVersion(void)
+{
+    return g_connected ? g_version : 0;
+}
+
+Result TapClientGetRecentPresents(UvcTapPresent* out, u32 max, u32* count)
+{
+    *count = 0;
+    if (g_version < 3)
+        return MAKERESULT(Module_Libnx, LibnxError_IncompatSysVer);
+    return serviceDispatchOut(&g_tapService, UvcTapCmd_GetRecentPresents, *count,
+        .buffer_attrs = { SfBufferAttr_Out | SfBufferAttr_HipcMapAlias },
+        .buffers = { { out, max * sizeof(UvcTapPresent) } },
+    );
 }
 
 Result TapClientGetSurface(UvcTapSurface* out)

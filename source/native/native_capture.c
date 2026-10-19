@@ -88,11 +88,18 @@ typedef struct {
     u32    convs, convFails, fenceTimeouts;
     u32    ivConvs;
     u64    ivReadNs, ivVicNs, ivFenceNs, ivFenceMax, ivReadBytes;
+    u32    ivFences;
 
     // H.264 (phase 3a) and the camera (3b)
     u32    encFails;
     u64    ivEncNs;
     bool   wasStreaming;     // a new stream starts on a keyframe
+    u32    commits;          // UvcDeviceCommitCount at the last frame: a new consumer wants a keyframe
+    u64    lastEncSeq;       // the present encoded last
+    u64    lastEncNs;        // when (through dmnt:cht: at most 30 a second)
+    u32    ivPickReady, ivPickWaited, ivSkipped;
+    u32    torn, rereads;    // copies the game changed under us
+    u64    nextSurfaceCheck; // the game may make new frame buffers mid-session
     bool   needKey;          // a send failed: the host lost a frame, restart the chain
     u32    sent, sendFails, ivSent;
     u64    ivSentBytes;
@@ -103,6 +110,14 @@ typedef struct {
 } Session;
 
 static Session g_s;
+
+// Back-off for sessions that end right after starting (a bug, or a game we
+// cannot handle): never cycle the donor and the engines in a tight loop
+static u64 g_retryAtNs = 0, g_retryDelayNs = 0;
+
+// When the running application last changed: how long a game switch keeps
+// the camera without frames (logged with the first frame of a session)
+static u64 g_appPid = 0, g_appSinceNs = 0;
 
 static u64 _nowNs(void) { return armTicksToNs(armGetSystemTick()); }
 
@@ -386,15 +401,45 @@ static void _source(const Session* s, const UvcTapPresent* p, VicSource* src)
 // block rows covering rect_h, and in each only the GOB columns covering
 // rect_w (blocks lie left to right, so they are contiguous). Handheld 720p
 // of a 1080p surface: 6 x 640 KB = 3.9 MB instead of 8.4 (SFT CornerFast).
-static bool _readRegion(Session* s, u64 addr, const VicSource* src, u64* bytes)
+typedef struct { u64 rowBytes, readPerRow, rows; } Region;
+
+static Region _region(const VicSource* src)
 {
-    u8* copy = VicEngineSlotCopy();
     const u64 blockRows = 8u << src->blk_h_log2;
     const u64 blockBytes = 512u << src->blk_h_log2;
     const u64 gobsX = ((u64)src->stride_px * 4 + 63) / 64;
-    const u64 rowBytes = gobsX * blockBytes;
-    const u64 readPerRow = (((u64)src->rect_w * 4 + 63) / 64) * blockBytes;
-    const u64 rows = (src->rect_h + blockRows - 1) / blockRows;
+    Region r = { gobsX * blockBytes, (((u64)src->rect_w * 4 + 63) / 64) * blockBytes,
+                 (src->rect_h + blockRows - 1) / blockRows };
+    return r;
+}
+
+// Did the game draw into the slot while we copied it? Eight 64-byte samples,
+// one per block row, against the copy (SFT ChangedSinceRead, WillMidia's PR
+// #4). A slow copy (through dmnt:cht ~20 ms) can outlast the game's next
+// frame: a torn picture, half old half new.
+static bool _changedSinceRead(Session* s, u64 addr, const VicSource* src)
+{
+    const Region r = _region(src);
+    const u8* copy = VicEngineSlotCopy();
+    for (u32 k = 0; k < 8 && r.rows; k++) {
+        const u64 off = (k % r.rows) * r.rowBytes + (((u64)k * 0x2340u % r.readPerRow) & ~63ULL);
+        if (off + 64 > s->surf.buf_size)
+            continue;
+        u8 alignas(64) b[64];
+        if (!GameDbgRead(&s->dbg, b, addr + off, sizeof(b)))
+            return false;
+        armDCacheFlush((void*)(copy + off), 64);  // our copy's view, as the engine reads it
+        if (memcmp(b, copy + off, sizeof(b)) != 0)
+            return true;
+    }
+    return false;
+}
+
+static bool _readRegion(Session* s, u64 addr, const VicSource* src, u64* bytes)
+{
+    u8* copy = VicEngineSlotCopy();
+    const Region reg = _region(src);
+    const u64 rowBytes = reg.rowBytes, readPerRow = reg.readPerRow, rows = reg.rows;
     u64 total = 0;
     for (u64 br = 0; br < rows; br++) {
         const u64 off = br * rowBytes;
@@ -409,6 +454,52 @@ static bool _readRegion(Session* s, u64 addr, const VicSource* src, u64* bytes)
     return true;
 }
 
+// Which present to encode (SFT M96, "capture the newest FINISHED present").
+// A game that queues frames ahead of its GPU has several in flight: waiting
+// on the newest cost ~39 ms a frame in a heavy game (12 fps). Among the
+// presents since the last one encoded: the newest whose fence is reached; if
+// none is, the oldest - the GPU finishes them in order, it is next. Its slot
+// stays intact until the present after the next one is drawn; the copy is
+// checked anyway (_changedSinceRead).
+static bool _pickPresent(Session* s, const UvcTapPresent* latest, UvcTapPresent* out)
+{
+    UvcTapPresent r[UVCTAP_RECENT_MAX];
+    u32 n = 0;
+    if (TapClientVersion() < 3 || R_FAILED(TapClientGetRecentPresents(r, UVCTAP_RECENT_MAX, &n)) || n == 0) {
+        r[0] = *latest;  // vi-tap v2: only the latest
+        n = 1;
+    }
+    s32 pick = -1, oldest = -1;
+    for (u32 i = 0; i < n; i++) {  // newest first
+        if (r[i].seq <= s->lastEncSeq || r[i].process_id != s->dbg.pid)
+            break;
+        if (VicEngineFenceReached(r[i].fence_count, r[i].fence)) {
+            pick = (s32)i;
+            break;
+        }
+        oldest = (s32)i;
+    }
+    if (pick >= 0) {
+        s->ivPickReady++;
+    } else if (oldest >= 0) {
+        u64 waited = 0;
+        if (!VicEngineWaitFence(r[oldest].fence_count, r[oldest].fence, FENCE_TIMEOUT_NS, &waited))
+            s->fenceTimeouts++;
+        s->ivFenceNs += waited;
+        s->ivFences++;
+        if (waited > s->ivFenceMax)
+            s->ivFenceMax = waited;
+        s->ivPickWaited++;
+        pick = oldest;
+    } else {
+        return false;  // nothing new
+    }
+    if (s->lastEncSeq && r[pick].seq > s->lastEncSeq + 1)
+        s->ivSkipped += (u32)(r[pick].seq - s->lastEncSeq - 1);
+    *out = r[pick];
+    return true;
+}
+
 // One present through the VIC: copy, convert (and encode, and send when a
 // camera app streams). The fence was waited on.
 static bool _convert(Session* s, const UvcTapPresent* p, bool send)
@@ -416,10 +507,18 @@ static bool _convert(Session* s, const UvcTapPresent* p, bool send)
     VicSource src;
     _source(s, p, &src);
     u64 bytes = 0, vicNs = 0;
+    const u64 addr = _slotAddr(s, p->slot);
     const u64 t0 = _nowNs();
-    if (!_readRegion(s, _slotAddr(s, p->slot), &src, &bytes)) {
+    if (!_readRegion(s, addr, &src, &bytes)) {
         s->convFails++;
         return false;
+    }
+    if (_changedSinceRead(s, addr, &src)) {
+        s->rereads++;
+        if (!_readRegion(s, addr, &src, &bytes) || _changedSinceRead(s, addr, &src)) {
+            s->torn++;  // skip it: the P chain goes on from the last frame we encoded
+            return false;
+        }
     }
     const u64 t1 = _nowNs();
     if (NvencActive()) {
@@ -440,6 +539,12 @@ static bool _convert(Session* s, const UvcTapPresent* p, bool send)
             _h264Append(s, frame, len);
             if (send) {
                 if (UvcDeviceSendFrame(frame, len, armTicksToNs(p->tick) / 1000000, idr)) {
+                    if (s->sent == 0) {
+                        const u64 now = _nowNs();
+                        LOG("native: first frame sent (%s, %u KB): %lu ms after the game appeared, %lu ms after attaching\n",
+                            idr ? "keyframe" : "P frame", len / 1024, g_appSinceNs ? (now - g_appSinceNs) / 1000000 : 0,
+                            (now - s->attachTick) / 1000000);
+                    }
                     s->sent++;
                     s->ivSent++;
                     s->ivSentBytes += len;
@@ -560,6 +665,15 @@ static bool _startSession(Session* s, const UvcTapPresent* p, const UvcTapSurfac
             s->slotCand[k] = (u8)k;
         SlotMatcherReset(&s->matcher, sf->num_slots, s->ncand);
         s->how = "matched";
+        // One object for every slot, and one region that can hold it: its
+        // candidates ARE the slots, at the offsets the game declared - nothing
+        // to match. (0100ba4026e94000: the region is larger than the set, and
+        // matching through dmnt:cht never converged.)
+        if (!s->separate && s->ncand == sf->num_slots) {
+            s->locked = true;
+            s->how = "single region";
+            _logMatch(s, "from the only region that holds the set");
+        }
         LOG("native: %u candidate buffer(s) from 0x%010lx - matching them to slots\n", s->ncand, s->cand[0]);
         if (sf->num_slots == 1) {
             s->locked = s->ncand == 1;
@@ -748,9 +862,11 @@ static void _logPeriodic(Session* s, const UvcTapPresent* p)
         VicEngineStats vs;
         VicEngineGetStats(&vs, true);
         const u64 n = s->ivConvs ? s->ivConvs : 1;
+        LOG("native: presents last 10 s: %u already finished, %u waited for, %u newer skipped (vi-tap protocol %u)\n",
+            s->ivPickReady, s->ivPickWaited, s->ivSkipped, TapClientVersion());
         LOG("native: VIC last 10 s: %u frames (%lu.%lu fps), per frame avg: fence wait %lu us (max %lu), read %lu KB in %lu us, "
             "VIC %lu us (max %lu) | total %u, failed %u, fence timeouts %u%s\n",
-            s->ivConvs, (u64)s->ivConvs / 10, (u64)s->ivConvs % 10, s->ivFenceNs / n / 1000, s->ivFenceMax / 1000,
+            s->ivConvs, (u64)s->ivConvs / 10, (u64)s->ivConvs % 10, s->ivFenceNs / (s->ivFences ? s->ivFences : 1) / 1000, s->ivFenceMax / 1000,
             s->ivReadBytes / n / 1024, s->ivReadNs / n / 1000, s->ivVicNs / n / 1000, vs.nsMax / 1000,
             s->convs, s->convFails, s->fenceTimeouts, VicEngineWedged() ? " - ENGINE WEDGED" : "");
         if (NvencActive() || NvencWedged()) {
@@ -758,8 +874,9 @@ static void _logPeriodic(Session* s, const UvcTapPresent* p)
             NvencGetStats(&es, true);
             const u64 ne = es.frames ? es.frames : 1;
             const u64 bits = (es.bytesI + es.bytesP) * 8;
-            LOG("native: USB last 10 s: %u frames sent (%lu KB), %u send failures in total, %u sent in total\n",
-                s->ivSent, s->ivSentBytes / 1024, s->sendFails, s->sent);
+            LOG("native: USB last 10 s: %u frames sent (%lu KB), %u send failures in total, %u sent in total; "
+                "copies re-read %u, torn and skipped %u\n",
+                s->ivSent, s->ivSentBytes / 1024, s->sendFails, s->sent, s->rereads, s->torn);
             s->ivSent = 0;
             s->ivSentBytes = 0;
             LOG("native: NVENC last 10 s: %u frames (%u.%u fps), %u keyframes, encode avg %lu us (max %lu), "
@@ -771,6 +888,8 @@ static void _logPeriodic(Session* s, const UvcTapPresent* p)
         }
         s->ivConvs = 0;
         s->ivReadNs = s->ivVicNs = s->ivFenceNs = s->ivFenceMax = s->ivReadBytes = 0;
+        s->ivFences = 0;
+        s->ivPickReady = s->ivPickWaited = s->ivSkipped = 0;
         s->ivEncNs = 0;
     }
 }
@@ -808,13 +927,44 @@ void NativeCaptureThread(void* arg)
             continue;
         }
 
+        if (st.app_pid != g_appPid) {
+            LOG("native: [%lus] application pid %lu -> %lu\n", _nowNs() / 1000000000ULL, g_appPid, st.app_pid);
+            g_appPid = st.app_pid;
+            g_appSinceNs = st.app_pid ? _nowNs() : 0;
+            g_retryAtNs = g_retryDelayNs = 0;  // a new game: no back-off
+        }
+
         // the game went away or another one runs
-        if (s->attached && (st.app_pid != s->dbg.pid || DebugPumpGone()))
-            _endSession(s, DebugPumpGone() ? "game exited" : "application changed");
+        if (s->attached && (st.app_pid != s->dbg.pid || (!s->dbg.dmnt && DebugPumpGone()))) {
+            const bool quick = _nowNs() - s->attachTick < 2000000000ULL;
+            _endSession(s, st.app_pid != s->dbg.pid ? "application changed" : "game exited");
+            if (quick && st.app_pid != 0) {
+                g_retryDelayNs = g_retryDelayNs ? (g_retryDelayNs * 2 > 30000000000ULL ? 30000000000ULL : g_retryDelayNs * 2)
+                                                : 2000000000ULL;
+                g_retryAtNs = _nowNs() + g_retryDelayNs;
+                LOG("native: that session lasted under 2 s - next attempt in %lu s\n", g_retryDelayNs / 1000000000ULL);
+            }
+        }
+
+
+        // The game made new frame buffers (a boot or loading set replaced,
+        // Minecraft loading a world - SFT v0.7.1): the addresses we read are
+        // gone, and reading them gives garbage. Start over on the new set:
+        // the next present starts a new session (and a keyframe).
+        if (s->attached && _nowNs() >= s->nextSurfaceCheck) {
+            s->nextSurfaceCheck = _nowNs() + 250000000ULL;
+            UvcTapSurface sf;
+            if (R_SUCCEEDED(TapClientGetSurface(&sf)) && sf.process_id == s->dbg.pid &&
+                (sf.generation != s->surf.generation || sf.num_slots != s->surf.num_slots)) {
+                LOG("native: the game made new frame buffers (set %u -> %u, %u -> %u slots)\n",
+                    s->surf.generation, sf.generation, s->surf.num_slots, sf.num_slots);
+                _endSession(s, "new frame buffers");
+            }
+        }
 
         const bool presenting = p.seq != 0 && p.process_id == st.app_pid && st.app_pid != 0 &&
                                 armTicksToNs(armGetSystemTick() - p.tick) < 500000000ULL;
-        if (!s->attached && presenting) {
+        if (!s->attached && presenting && _nowNs() >= g_retryAtNs) {
             UvcTapSurface sf;
             if (R_FAILED(TapClientGetSurface(&sf)) || sf.process_id != p.process_id) {
                 if (failedPid != p.process_id) {
@@ -834,19 +984,13 @@ void NativeCaptureThread(void* arg)
 
         if (s->attached && woke && p.seq != s->lastSeq) {
             const bool streaming = UvcDeviceIsStreaming();
-            // per frame work only while matching the buffers, or while a
-            // camera app streams: otherwise the game pays nothing
-            const bool encode = s->locked && NvencActive() && streaming;
-            if (!s->locked || encode) {
+            const bool encodeable = s->locked && NvencActive() && streaming;
+            if (!s->locked) {
+                // matching the buffers: sample the latest present, finished
                 if (VicEngineActive()) {
-                    // the present's acquire fence: the GPU may still be
-                    // drawing the slot when the game queues it
                     u64 waited = 0;
                     if (!VicEngineWaitFence(p.fence_count, p.fence, FENCE_TIMEOUT_NS, &waited))
                         s->fenceTimeouts++;
-                    s->ivFenceNs += waited;
-                    if (waited > s->ivFenceMax)
-                        s->ivFenceMax = waited;
                 } else {
                     const u64 due = armTicksToNs(p.tick) + SAMPLE_DELAY_NS;
                     const u64 now = _nowNs();
@@ -860,14 +1004,29 @@ void NativeCaptureThread(void* arg)
             if (s->locked && NvencActive()) {
                 if (streaming && !s->wasStreaming) {
                     s->needKey = true;  // a new stream starts on a keyframe
-                    LOG("native: a camera app is streaming - native H.264 720p from now on\n");
+                    LOG("native: a camera app is streaming - native H.264 720p%s from now on\n",
+                        s->dbg.dmnt ? " at up to 30 fps (read through dmnt:cht)" : "");
                 } else if (!streaming && s->wasStreaming) {
                     LOG("native: the camera app stopped streaming\n");
                 }
                 s->wasStreaming = streaming;
+                // an app reopened the camera while it was already streaming
+                // (ffplay relaunched): it decodes nothing until a keyframe
+                const u32 commits = UvcDeviceCommitCount();
+                if (commits != s->commits) {
+                    s->commits = commits;
+                    s->needKey = true;
+                }
             }
-            if (encode)
-                _convert(s, &p, true);
+            // Through dmnt:cht a copy takes ~20 ms (5x slower than direct,
+            // SFT): at most 30 frames a second keeps them whole
+            const bool due = !s->dbg.dmnt || _nowNs() - s->lastEncNs >= 33000000ULL;
+            UvcTapPresent pick;
+            if (encodeable && due && _pickPresent(s, &p, &pick)) {
+                s->lastEncSeq = pick.seq;
+                s->lastEncNs = _nowNs();
+                _convert(s, &pick, true);
+            }
 #if NATIVE_DEBUG
             else if (s->locked && !NvencActive() && _nowNs() >= s->nextRead) {
                 _throughputRead(s, p.slot);

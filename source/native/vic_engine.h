@@ -74,6 +74,9 @@ bool VicEnginePin(u32 handle, u32* vicAddr);
 // Polls nvhost-ctrl until every syncpoint reached it, at most timeoutNs.
 // Returns false on timeout. Needs the engine open (ctrl fd).
 bool VicEngineWaitFence(u32 count, const u64* fence, u64 timeoutNs, u64* waitedNs);
+// The same, without waiting: has the GPU finished that present? (No fence
+// known counts as finished.)
+bool VicEngineFenceReached(u32 count, const u64* fence);
 
 typedef struct { u32 jobs, timeouts, refused; u64 nsTotal, nsMax; } VicEngineStats;
 void VicEngineGetStats(VicEngineStats* out, bool reset);

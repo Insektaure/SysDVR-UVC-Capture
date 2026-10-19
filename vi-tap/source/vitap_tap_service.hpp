@@ -12,7 +12,8 @@
     AMS_SF_METHOD_INFO(C, H, 1, void, GetPresentEvent,  (sf::OutCopyHandle out),             (out))       \
     AMS_SF_METHOD_INFO(C, H, 2, void, GetLatestPresent, (sf::Out<UvcTapPresent> out),        (out))       \
     AMS_SF_METHOD_INFO(C, H, 3, void, GetStats,         (sf::Out<UvcTapStats> out),          (out))       \
-    AMS_SF_METHOD_INFO(C, H, 4, void, GetSurface,       (sf::Out<UvcTapSurface> out),        (out))
+    AMS_SF_METHOD_INFO(C, H, 4, void, GetSurface,       (sf::Out<UvcTapSurface> out),        (out))       \
+    AMS_SF_METHOD_INFO(C, H, 5, void, GetRecentPresents, (const sf::OutBuffer &out, sf::Out<u32> count), (out, count))
 
 AMS_SF_DEFINE_INTERFACE(ams::vitap, ITapService, VITAP_TAP_INTERFACE_INFO, 0x56544205)
 
@@ -25,6 +26,7 @@ namespace ams::vitap {
             void GetLatestPresent(sf::Out<UvcTapPresent> out);
             void GetStats(sf::Out<UvcTapStats> out);
             void GetSurface(sf::Out<UvcTapSurface> out);
+            void GetRecentPresents(const sf::OutBuffer &out, sf::Out<u32> count);
     };
     static_assert(IsITapService<TapService>);
 

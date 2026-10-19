@@ -15,6 +15,7 @@ namespace ams::vitap {
 
         constinit os::SdkMutex g_lock;
         constinit UvcTapPresent g_latest = {};
+        constinit UvcTapPresent g_ring[UVCTAP_RECENT_MAX] = {};  /* by seq % UVCTAP_RECENT_MAX */
         constinit UvcTapSurface g_surface = {};
 
         /* setPreallocatedBuffer's input parcel carries a flattened
@@ -193,6 +194,7 @@ namespace ams::vitap {
             r.tick = armGetSystemTick();
             r.slot_mask = g_latest.slot_mask | ((r.slot >= 0 && r.slot < 32) ? 1u << r.slot : 0);
             g_latest = r;
+            g_ring[r.seq % UVCTAP_RECENT_MAX] = r;
         }
         g_counters.presents.fetch_add(1, std::memory_order_relaxed);
         os::SignalSystemEvent(std::addressof(g_present_event));
@@ -201,6 +203,17 @@ namespace ams::vitap {
     void GetLatestPresent(UvcTapPresent *out) {
         std::scoped_lock lk(g_lock);
         *out = g_latest;
+    }
+
+    u32 GetRecentPresents(UvcTapPresent *out, u32 max) {
+        std::scoped_lock lk(g_lock);
+        u32 n = 0;
+        for (u64 seq = g_latest.seq; seq != 0 && n < max && n < UVCTAP_RECENT_MAX; --seq) {
+            const UvcTapPresent &r = g_ring[seq % UVCTAP_RECENT_MAX];
+            if (r.seq != seq || r.process_id != g_latest.process_id) { break; }   /* overwritten, or another game's */
+            out[n++] = r;
+        }
+        return n;
     }
 
     void GetSurface(UvcTapSurface *out) {

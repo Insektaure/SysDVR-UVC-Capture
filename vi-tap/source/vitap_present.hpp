@@ -31,6 +31,8 @@ namespace ams::vitap {
     void OnBinderTransaction(const sm::MitmProcessInfo &ci, u32 code, const void *parcel, size_t size);
 
     void GetLatestPresent(UvcTapPresent *out);
+    /* the last presents, newest first (at most UVCTAP_RECENT_MAX); returns how many */
+    u32 GetRecentPresents(UvcTapPresent *out, u32 max);
     void GetSurface(UvcTapSurface *out);
     void GetStats(UvcTapStats *out);
     os::NativeHandle GetPresentEventHandle();

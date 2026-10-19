@@ -18,6 +18,11 @@ Result TapClientGetLatestPresent(UvcTapPresent* out);
 Result TapClientGetStats(UvcTapStats* out);
 Result TapClientGetSurface(UvcTapSurface* out);
 
+// The protocol vi-tap speaks (0 = not connected). v3 keeps a present history.
+u32    TapClientVersion(void);
+// v3: the last presents, newest first (max <= UVCTAP_RECENT_MAX).
+Result TapClientGetRecentPresents(UvcTapPresent* out, u32 max, u32* count);
+
 // Phase 1 spike (docs/NATIVE-CAPTURE.md §11): reads present records and logs
 // them, nothing else. Built only with -DTAP_PROBE.
 void TapProbeThread(void* arg);

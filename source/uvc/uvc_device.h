@@ -94,6 +94,10 @@ bool UvcDeviceIsConnected(void);
  */
 bool UvcDeviceIsStreaming(void);
 
+// Number of stream commits so far: changes when an app (re)opens the camera,
+// which then needs a keyframe before anything decodes.
+u32 UvcDeviceCommitCount(void);
+
 /**
  * Get the current video format requested by host
  * @return Active format or 0 if not streaming

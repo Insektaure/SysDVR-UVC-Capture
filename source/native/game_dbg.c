@@ -387,11 +387,14 @@ void DebugPumpStop(void)
     threadClose(&g_pumpThread);
     g_pumpRunning = false;
     g_pumpHandle = INVALID_HANDLE;
+    // the next session starts clean: a stale "gone" from the last game ended
+    // every session through dmnt:cht at once (no pump there), 884 restarts
+    g_pumpGone = false;
 }
 
 bool DebugPumpGone(void)
 {
-    return g_pumpGone;
+    return g_pumpRunning && g_pumpGone;
 }
 
 void DebugPumpGetStats(DebugPumpStats* out)

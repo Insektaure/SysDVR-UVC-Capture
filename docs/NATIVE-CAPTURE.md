@@ -490,6 +490,25 @@ keyframe. Switching to grc:d mid-stream would show up to ~2 s of broken
 picture (grc's keyframe interval), and grc:d gives nothing in the cases
 where it would matter most (games that block recording, HOME).
 
+### Picking the present (vi-tap protocol v3)
+
+vi-tap keeps the last 8 present records (`GetRecentPresents`, command 5,
+newest first, map-alias out buffer). Among the presents since the last one
+encoded, SysDVR-UVC encodes the newest whose GPU fence is already reached;
+if none is, it waits for the oldest (the GPU finishes them in order) - SFT
+M96. Measured before: a GPU-heavy game that queues frames ahead (01003ec027cc8000)
+cost ~39 ms of fence wait per frame, ~12 fps. A light game is unchanged: the
+previous present is already encoded, so the newest is the only candidate.
+Through dmnt:cht, at most one encode per 33 ms. A copy the game drew over is
+re-read once, else skipped (8 samples, one per block row). SysDVR-UVC still
+works with a v2 vi-tap (latest present only) until the next reboot.
+
+Also fixed after the game-switch tests: a stale "game exited" from the debug
+pump ended every session through dmnt:cht at once (884 restarts; now a
+back-off of 2-30 s for sessions under 2 s), a single region holding the set
+is used directly (matching through dmnt:cht never converged), and every new
+stream commit (an app reopening the camera) forces a keyframe.
+
 ## 12. Licence and credit
 
 Both projects are GPL-2.0. Code taken from SFT (vi mitm parsing, debug pump,

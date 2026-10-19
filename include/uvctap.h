@@ -10,7 +10,7 @@
 #include <stdint.h>
 
 #define UVCTAP_SERVICE_NAME "uvctap"
-#define UVCTAP_VERSION      2
+#define UVCTAP_VERSION      3
 
 // Program id of vi-tap (atmosphere/contents/<id>/)
 #define UVCTAP_PROGRAM_ID   0x00FF0000A53BB667ull
@@ -21,7 +21,13 @@ enum {
     UvcTapCmd_GetLatestPresent = 2,  // () -> UvcTapPresent
     UvcTapCmd_GetStats         = 3,  // () -> UvcTapStats
     UvcTapCmd_GetSurface       = 4,  // () -> UvcTapSurface (v2)
+    UvcTapCmd_GetRecentPresents = 5, // out buffer (map alias) of UvcTapPresent, newest first -> u32 count (v3)
 };
+
+// How many presents vi-tap keeps (v3). A game that queues frames ahead of its
+// GPU has several presents in flight: the reader takes the newest one whose
+// fence is reached instead of waiting on the latest (SFT M96).
+#define UVCTAP_RECENT_MAX 8
 
 // The application's last queueBuffer (IGraphicBufferProducer code 7).
 // The parcels carry no buffer addresses: the reader finds each slot's memory
