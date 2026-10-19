@@ -518,6 +518,60 @@ either way). The log counts overlapped and lone jobs. (First version: a fixed tr
 on loading screens and never saw game 3 running.) Before it, at
 01003ec027cc8000 through dmnt:cht: copy ~10 ms + VIC ~18 ms (the compositor
 shares the VIC) + encode ~1.6 ms = ~30 fps of the game's ~47.
+Why the VIC is slow in GPU-heavy games (measured, 01003ec027cc8000): the VIC
+syncpoint is shared with the compositor, so the gap between the submit's
+fence and the syncpoint's value is work queued ahead of ours. Jobs with
+nothing ahead took 0.6-2 ms; with compositor work ahead (95-99% of them)
+17-41 ms - the compositor's VIC job waits on the game's GPU, ours behind it.
+The VIC and EMC clocks never moved (422 / 1331 MHz). So a third mode: the CPU
+converts (source/native/cpu_convert.c, NEON, on our core 3: the game has
+0-2) straight into NVENC's 16-row block-linear input, BT.709 limited range,
+chroma from the 2x2 average. Checked against the VIC on the console: Y within
+1 (mean 0.03), UV mean 0.6 (single pixels up to ~90 on sharp colour edges:
+the VIC filters chroma differently). ~12 ms a frame in that game (the frame
+comes from memory the GPU keeps busy); 1280x720 rects without horizontal flip
+only. The trial now alternates VIC, VIC pipelined and CPU windows (12, in a
+mirrored order) and keeps the simplest mode unless another is at least 3%
+better.
+Measured in 01003ec027cc8000 through dmnt:cht: the trial chose the CPU every
+time (93%/92%/82% of the game's frames against 51-76% for the VIC modes),
+34-40 fps steady (VIC: 22-30): copy ~9.5 ms + CPU ~12.5 ms + encode ~1.6 ms.
+The trial only starts after 3 windows in a row at a stable rate (within 20%),
+and a trial window whose rate drifted 30% from the start's does not count (a
+first trial during loading had chosen wrongly).
+Fused read and conversion: the CPU route no longer uses a slot copy. Each
+block row (640 KB for a 1280-wide rect) is read into the bounce buffer -
+dmnt:cht writes it there with no copy of ours (GameDbgReadTo), a direct read
+too - and converted at once while it is still in the cache. Before, dmnt:cht
+wrote the bounce, we copied it to the slot copy (3.8 MB a frame), and the
+conversion read all of it again from memory (the L2 is 2 MB). The torn check
+keeps its 8 samples from the pieces as they pass and compares them with the
+game's memory after the frame; a torn or failed frame marks the encoder's
+picture bad, and the keep-alive does not re-send it.
+Choosing the mode without switching (replaces the trials): a trial spent
+~16 s of every 2 minutes in the weaker modes (visible drops, ~31 fps against
+~36). The loop does one frame after the other on one core, so a frame costs
+the sum of its steps; each step is a moving average measured on every frame
+of the current mode, and the other modes' costs are probed beside it while
+the capture is behind a steady game (<95% of its presents): in CPU mode a
+VIC job into the VIC's own output every 3 s, not waited on - its cost is the
+compositor queue in front of it, not the picture - and polled between the
+CPU frame's pieces (a few ms of precision); on the VIC one CPU conversion of
+the last frame every 3 s until 3 probes newer than 30 s are known. A probed
+cost is the median of the last 5 fresh probes (3 let one lucky VIC probe
+- the queue swings 1.5-40 ms - cause a switch the check had to undo): a first version averaged them
+slowly, and one 50 ms CPU probe taken as a loading screen ended (11-15 ms
+after) kept game 3 on the VIC for 2 minutes. Predicted
+frame costs: VIC = read through the slot copy + VIC job + encode; CPU =
+piecewise read (2/3 of the former through dmnt:cht, measured) + conversion +
+encode; pipelined = the longer of read and VIC job + encode, or as measured
+while pipelined - a candidate only where the CPU cannot convert. A mode
+predicted 15% faster in two windows in a row is switched to; two windows
+later its share of the game's presents is compared with the one before, and
+a 3% (relative) worse share goes back, the mode not tried again for 20 s,
+doubled at each failure in a row up to 160 s (a load spike failed a good
+mode once: with a fixed 60 s, game 3 spent 1.5 minutes on the VIC).
+The VIC queue diagnostic is gone (its finding is above).
 Startup: the 20 s wait
 for the system to come up only applies in the first minute after boot;
 turned on later from ovlSysmodules, SysDVR-UVC starts at once. SysDVR-UVC still

@@ -76,9 +76,13 @@ bool VicEngineConvertTo(const VicSource* src, const VicTarget* dst, u64* ns);
 // submit wedges the engine (JobWait returns false).
 bool VicEngineSubmitTo(const VicSource* src, const VicTarget* dst);
 bool VicEngineJobPending(void);
-// Of the job last submitted: syncpoint increments queued ahead of it at
-// submit (the VIC syncpoint is shared with the compositor).
-u32  VicEngineJobAhead(void);
+// The same into the engine's own output (VicEngineOutput): nothing else reads
+// it - a probe of what a job costs now (the queue in front of it).
+bool VicEngineSubmitOwn(const VicSource* src);
+// Without waiting: 1 the job is done (collected, *ns submit to done, as
+// precise as the calls are frequent), 0 not yet, -1 no job or it failed (past
+// the timeout it is collected as by JobWait: the engine is wedged).
+int  VicEngineJobPoll(u64* ns);
 bool VicEngineJobWait(u64* ns, u64* blockedNs);
 
 // For the encoder: the same nvdrv session's nvmap and ctrl fds, and a pin of

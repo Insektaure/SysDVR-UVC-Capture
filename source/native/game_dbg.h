@@ -40,6 +40,10 @@ Result GameDbgResume(GameDbg* d, u32* nev);
 // work). With a bounce buffer set, dmnt reads go through it in pieces.
 void GameDbgSetBounce(void* buf, size_t size);
 bool GameDbgRead(GameDbg* d, void* dst, u64 va, size_t len);
+// Straight into dst, never through the bounce (dst must be a valid IPC
+// buffer: plain memory, the bounce itself for instance): the CPU route reads
+// each piece where it converts it.
+bool GameDbgReadTo(GameDbg* d, void* dst, u64 va, size_t len);
 bool GameDbgQuery(GameDbg* d, MemoryInfo* mi, u64 addr);
 
 // Stops the pump first if it runs on this handle, then closes it.

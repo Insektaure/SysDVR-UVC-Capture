@@ -39,7 +39,6 @@ static u8* g_slotCpu[2] = { NULL, NULL };
 static bool g_jobPending = false;
 static u32 g_jobFence = 0;
 static u64 g_jobT0 = 0;
-static u32 g_jobAhead = 0;   // syncpoint increments queued before ours at submit (the compositor's)
 static VicEngineStats g_stats;
 
 static bool _nvmapOwn(void* cpu, u32 size, bool cacheable, u32* handle)
@@ -345,17 +344,31 @@ bool VicEngineSubmitTo(const VicSource* src, const VicTarget* dst)
     g_jobFence = sb[12];
     g_jobT0 = t0;
     g_jobPending = true;
-    // The VIC syncpoint is shared with the compositor: the submit returns the
-    // syncpoint's new maximum, the value now is what has completed - the gap,
-    // less our own increment, is work queued ahead of ours
-    struct { u32 id, value; } r = { g_syncpt, 0 };
-    u32 e = 0;
-    g_jobAhead = R_SUCCEEDED(NvdrvIoctl(g_ctrlFd, NVHOST_IOC_CTRL_SYNCPT_READ, &r, sizeof(r), &e)) && !e &&
-                 (s32)(g_jobFence - r.value) > 1 ? g_jobFence - r.value - 1 : 0;
     return true;
 }
 
-u32 VicEngineJobAhead(void) { return g_jobAhead; }
+bool VicEngineSubmitOwn(const VicSource* src)
+{
+    const VicTarget own = { g_outAddr, g_outAddr + VIC_OUT_LUMA, false };
+    return VicEngineSubmitTo(src, &own);
+}
+
+int VicEngineJobPoll(u64* ns)
+{
+    if (!g_jobPending)
+        return -1;
+    const u64 dt = armTicksToNs(armGetSystemTick()) - g_jobT0;
+    if (!_syncptReached(g_syncpt, g_jobFence))
+        return dt < SUBMIT_TIMEOUT_POLLS * 100000ULL ? 0 : (VicEngineJobWait(ns, NULL) ? 1 : -1);
+    g_jobPending = false;
+    g_stats.jobs++;
+    g_stats.nsTotal += dt;
+    if (dt > g_stats.nsMax)
+        g_stats.nsMax = dt;
+    if (ns)
+        *ns = dt;
+    return 1;
+}
 
 bool VicEngineJobPending(void) { return g_jobPending; }
 

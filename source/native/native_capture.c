@@ -22,6 +22,7 @@
 #include "vic.h"
 #include "vic_engine.h"
 #include "nvenc_engine.h"
+#include "cpu_convert.h"
 #include "../uvc/uvc_device.h"
 #include "native_capture.h"
 
@@ -43,21 +44,39 @@
 #define DUMP_DIR          "/config/sysdvr-uvc/dump"
 #define DONOR_MB          32           // per game session: VIC buffers + slot copy (12.5 MB), encoder arena (7.1), frame (1.5), second slot copy (8.5)
 #define ENCODE_QP         20           // SFT: constant QP 20 (P frames 22)
-// Pipelining: the next frame is copied while the VIC converts this one. Kept
-// only where it measures faster. The capture is watched in 2 s windows: the
-// share of the game's presents it encodes. When it falls behind a game that
-// presents steadily (loading screens and pauses do not count), a trial
-// alternates windows of each mode (ABBA: a trend in the game's load hits both
-// alike) and compares their average share. Again every TRIAL_EVERY_NS, or
-// soon when the trial saw too few steady windows to tell.
-#define TRIAL_WINDOW_NS   2000000000ULL
-#define TRIAL_WINDOWS     8
-#define TRIAL_EVERY_NS    120000000000ULL
-#define TRIAL_RETRY_NS    10000000000ULL
-#define TRIAL_MIN_FPS     20           // a window counts when the game presented at least this fast
-#define TRIAL_BEHIND_PML  950          // a trial is worth it below this share (per mille) of the game's presents
-#define TRIAL_GAIN_PCT    3            // pipelined must capture this much more (relative) to be kept
-static const bool kTrialPipe[TRIAL_WINDOWS] = { false, true, true, false, false, true, true, false };
+// How a frame becomes the encoder's picture (one of):
+//  - VIC: copy, then a VIC job, collected at once;
+//  - VIC pipelined: the next frame is copied while the VIC converts this one;
+//  - CPU: each piece read and converted at once with NEON on our own core
+//    (cpu_convert.c), no VIC at all. In GPU-heavy games every VIC job waits
+//    behind the compositor's, itself waiting on the game's GPU (17-41 ms for a
+//    0.6 ms job, 01003ec027cc8000). 1280x720 rects only (CpuCanConvert).
+// The loop does one frame after the other on one core, so a frame costs the
+// sum of its steps: every step is measured on every frame of the current
+// mode, and the others' costs are probed beside it, without switching: in CPU
+// mode a VIC job into the VIC's own output, not waited on (its cost is the
+// queue in front of it, not the picture), polled between the pieces of the
+// CPU frames; on the VIC a CPU conversion of the last frame into the bounce.
+// Probes only while the capture falls behind a game presenting steadily (2 s
+// windows: the share of the game's presents encoded; loading screens and
+// pauses do not count). A mode predicted MODE_GAIN_PCT faster twice in a row
+// is switched to, then checked: 2 windows later its share must not be worse
+// than before, or it is left again and not tried for MODE_BLOCK_NS. Pipelined
+// is a candidate only where the CPU cannot convert (its overlap cannot be
+// predicted well; the check guards it).
+enum { MODE_VIC, MODE_PIPE, MODE_CPU, MODES };
+static const char* const kModeName[MODES] = { "VIC", "VIC pipelined", "CPU" };
+#define MODE_WINDOW_NS    2000000000ULL
+#define MODE_MIN_FPS      20           // a window counts when the game presented at least this fast
+#define MODE_RATE_PCT     20           // ... at a rate within this much of the previous window's
+#define MODE_BEHIND_PML   950          // behind: under this share (per mille) of the game's presents
+#define MODE_GAIN_PCT     15           // predicted this much faster, twice in a row: switch
+#define MODE_CHECK_PCT    3            // after a switch: a share this much (relative) worse goes back
+#define MODE_BLOCK_NS     20000000000ULL   // a mode that failed its check is not tried for this long, doubled at each failure in a row
+#define MODE_BLOCK_MAX_NS 160000000000ULL
+#define PROBE_EVERY_NS    3000000000ULL
+#define PROBE_STALE_NS    30000000000ULL  // a probe older than this no longer counts
+#define PROBE_KEEP        5            // a probed cost: the median of the last ones still fresh
 #define H264_DUMP_FRAMES  0            // 3a wrote the first N frames to <program>.h264; off while streaming (SD writes cost latency)
 
 extern volatile bool g_nativeCaptureRunning;
@@ -107,29 +126,44 @@ typedef struct {
     u32    ivFences, ivCopies;
     u64    ivVicWaitNs;      // of ivVicNs, what the loop spent waiting for the VIC
     u32    ivOverlapped, ivAlone;  // pipelined jobs collected after the next copy / with nothing to overlap
-    // the VIC queue theory: job times (one after the other only: exact) by
-    // compositor work queued ahead at submit, and by the game's presents the
-    // GPU had not finished at pick (0, 1, 2+)
-    u32    pickBacklog, jobBacklog, jobAhead;
-    bool   jobTimed;
-    u32    qN[3], bN[3];
-    u64    qNs[3], bNs[3];
+    VicSource jobSrc, lastSrc;   // the job's source, and the last one encoded
+    bool   haveLast;
+    bool   jobCpu;           // the job's picture was made by the CPU: nothing to collect
+    bool   pictBad;          // the encoder's picture holds a torn or partial frame: not to be re-sent
+    u32    ivVicJobs, ivCpuN, ivCpuUnsup;
+    u64    ivCpuNs, ivCpuMax;
+    bool   jobTimed;         // collected at once: its time is the job's
 
-    // pipelining (TRIAL_*)
-    bool   pipe;             // copy the next frame while the VIC converts this one
+    // the mode (MODE_*)
+    u32    mode;
+    bool   pipe;             // mode == MODE_PIPE: copy the next frame while the VIC converts this one
     bool   pending;          // a VIC job in flight
     bool   again;            // a newer present was left for after the job: look again at once
     UvcTapPresent job;       // its present
     u32    jobCopy;          // the slot copy it reads
-    bool   pipeKept;         // what the last conclusive trial chose
+    // the steps' costs (moving averages, ns; 0 unknown): the read through the
+    // slot copy (VIC routes) or piece by piece (CPU), the VIC job, the CPU
+    // conversion, the encode, and a pipelined frame as measured
+    u64    eReadCopy, eReadFused, eVic, eCpu, eEnc, ePipe;
+    // the last probes of each (ns, and when): one probe taken in a bad moment
+    // (01003ec027cc8000: 50 ms at the end of a loading screen, 11-15 after)
+    // must not decide alone
+    u64    vicP[PROBE_KEEP], vicPt[PROBE_KEEP], cpuP[PROBE_KEEP], cpuPt[PROBE_KEEP];
+    u32    vicPn, cpuPn;
+    u64    jobPipeNs;        // the pipelined job's read and VIC wait
+    bool   probing;          // a VIC probe in flight
+    u64    nextProbe;
+    u32    ivProbes;
+    u64    ivProbeNs;
+    // the 2 s windows
     u64    winStartNs;       // the window being watched (0: none)
     u64    winSeq;
     u32    winConvs;
-    u64    nextTrialNs;
-    u32    trialWin;         // windows done in the running trial (0: none running)
-    u32    trialSum[2], trialN[2], trialFps[2];  // per mode: shares (per mille) and fps of the steady windows
-    u16    trialPml[TRIAL_WINDOWS];             // each window's share, 0xFFFF: not steady
-
+    u32    lastRate;         // the game's presents a second in the last window
+    u32    pml[2];           // the last two steady windows' shares (per mille), newest first; 0 none
+    u32    want, wantMode;   // windows in a row a faster mode was predicted, and which
+    u32    checkWin, prevMode, prevPml;  // after a switch: windows left before the check, what it replaced
+    u64    blockUntil[MODES], blockNs[MODES];
     // H.264 (phase 3a) and the camera (3b)
     u32    encFails;
     u64    ivEncNs;
@@ -429,12 +463,14 @@ static void _h264Append(Session* s, const u8* data, u32 len)
 // The order matters: no dmnt read may use the bounce once the memory goes;
 // the nvdrv session must be closed (freeing every pin) before the unmap.
 static void _finish(Session* s);
+static void _probeDrain(Session* s);
 
 static void _releaseMemory(Session* s)
 {
     if (!s->mem)
         return;
     _finish(s);  // never a job in flight on memory that goes
+    _probeDrain(s);
     GameDbgSetBounce(NULL, 0);
     NvencClose();
     VicEngineClose();
@@ -551,7 +587,6 @@ static bool _pickPresent(Session* s, const UvcTapPresent* latest, UvcTapPresent*
         }
         oldest = (s32)i;
     }
-    s->pickBacklog = pick >= 0 ? (u32)pick : 0;  // newer presents than the pick, all unfinished
     if (pick >= 0) {
         s->ivPickReady++;
     } else if (oldest >= 0) {
@@ -578,28 +613,168 @@ static bool _pickPresent(Session* s, const UvcTapPresent* latest, UvcTapPresent*
     return true;
 }
 
-// The job in flight: collect it, encode its picture, send it.
+// A moving average over ~2^shift samples (0: none yet)
+static void _ema(u64* e, u64 x, u32 shift)
+{
+    *e = *e ? (u64)((s64)*e + (((s64)x - (s64)*e) >> shift)) : x;
+}
+
+// A probe's result: kept with the last ones; the cost is their median (of
+// those still fresh)
+static u64 _probeAdd(u64* v, u64* t, u32* n, u64 ns)
+{
+    const u64 now = _nowNs();
+    v[*n % PROBE_KEEP] = ns;
+    t[*n % PROBE_KEEP] = now;
+    (*n)++;
+    u64 f[PROBE_KEEP];
+    u32 k = 0;
+    for (u32 i = 0; i < PROBE_KEEP && i < *n; i++) {
+        if (now - t[i] < PROBE_STALE_NS)
+            f[k++] = v[i];
+    }
+    for (u32 i = 1; i < k; i++) {  // sort the (at most PROBE_KEEP)
+        for (u32 j = i; j > 0 && f[j - 1] > f[j]; j--) {
+            const u64 x = f[j]; f[j] = f[j - 1]; f[j - 1] = x;
+        }
+    }
+    return k % 2 ? f[k / 2] : (f[k / 2 - 1] + f[k / 2]) / 2;
+}
+
+static u32 _probesFresh(const u64* t, u32 n)
+{
+    const u64 now = _nowNs();
+    u32 k = 0;
+    for (u32 i = 0; i < PROBE_KEEP && i < n; i++)
+        k += now - t[i] < PROBE_STALE_NS;
+    return k;
+}
+
+// The VIC probe in flight: done yet? (Between the pieces of a CPU frame and
+// once a pass: a few ms of precision.)
+static void _probePoll(Session* s)
+{
+    if (!s->probing)
+        return;
+    u64 ns = 0;
+    const int r = VicEngineJobPoll(&ns);
+    if (r == 0)
+        return;
+    s->probing = false;
+    s->nextProbe = _nowNs() + PROBE_EVERY_NS;
+    if (r > 0) {
+        s->eVic = _probeAdd(s->vicP, s->vicPt, &s->vicPn, ns);
+        s->ivProbes++;
+        s->ivProbeNs += ns;
+    }
+}
+
+// Before the VIC is used for real (or its memory goes): the probe collected
+static void _probeDrain(Session* s)
+{
+    if (!s->probing)
+        return;
+    u64 ns = 0;
+    s->probing = false;
+    s->nextProbe = _nowNs() + PROBE_EVERY_NS;
+    if (VicEngineJobWait(&ns, NULL))
+        s->eVic = _probeAdd(s->vicP, s->vicPt, &s->vicPn, ns);
+}
+
+// The CPU route (MODE_CPU): each block row of the frame read into the bounce
+// buffer (cached, plain memory - dmnt:cht writes it there with no copy of
+// ours, a direct read too) and converted at once into the encoder's picture,
+// while it is still in the cache: no slot copy, no second pass over memory.
+// The torn check's 8 samples are kept from the pieces as they pass (the
+// same places as _changedSinceRead).
+typedef struct { u8 b[8][64]; bool valid[8]; } TornSamples;
+
+static u64 _sampleOff(const Region* r, u32 k)
+{
+    return (k % r->rows) * r->rowBytes + (((u64)k * 0x2340u % r->readPerRow) & ~63ULL);
+}
+
+static bool _readConvert(Session* s, u64 addr, const VicSource* src, TornSamples* ts, u64* bytes, u64* readNs, u64* cpuNs)
+{
+    const Region r = _region(src);
+    u8* chunk = VicEngineBounce();
+    u8 *luma = NULL, *chroma = NULL;
+    u32 lumaBytes = 0, chromaBytes = 0;
+    NvencPictureCpu(&luma, &chroma, &lumaBytes, &chromaBytes);
+    if (!chunk || !luma || r.readPerRow > VicEngineBounceSize())
+        return false;
+    const u32 lines = CpuBlockRowLines(src);
+    memset(ts->valid, 0, sizeof(ts->valid));
+    for (u64 br = 0; br < r.rows; br++) {
+        const u64 off = br * r.rowBytes;
+        if (off + r.readPerRow > s->surf.buf_size)
+            break;
+        const u64 t0 = _nowNs();
+        if (!GameDbgReadTo(&s->dbg, chunk, addr + off, r.readPerRow))
+            return false;
+        const u64 t1 = _nowNs();
+        *readNs += t1 - t0;
+        *bytes += r.readPerRow;
+        for (u32 k = 0; k < 8; k++) {
+            const u64 so = _sampleOff(&r, k);
+            if (k % r.rows == br && so + 64 <= s->surf.buf_size) {
+                memcpy(ts->b[k], chunk + (so - off), 64);
+                ts->valid[k] = true;
+            }
+        }
+        const u32 first = (u32)br * lines, end = first + lines < VIC_OUT_H ? first + lines : VIC_OUT_H;
+        if (first < VIC_OUT_H && !CpuConvertRows(chunk, off, src, first, end, luma, chroma, true))
+            return false;
+        *cpuNs += _nowNs() - t1;
+        _probePoll(s);
+    }
+    const u64 t2 = _nowNs();
+    armDCacheFlush(luma, lumaBytes);  // NVENC reads it from memory
+    armDCacheFlush(chroma, chromaBytes);
+    *cpuNs += _nowNs() - t2;
+    return true;
+}
+
+static bool _changedSinceSamples(Session* s, u64 addr, const VicSource* src, const TornSamples* ts)
+{
+    const Region r = _region(src);
+    for (u32 k = 0; k < 8 && r.rows; k++) {
+        if (!ts->valid[k])
+            continue;
+        u8 alignas(64) b[64];
+        if (!GameDbgRead(&s->dbg, b, addr + _sampleOff(&r, k), sizeof(b)))
+            return false;
+        if (memcmp(b, ts->b[k], sizeof(b)) != 0)
+            return true;
+    }
+    return false;
+}
+
+// The job in flight: collect it (a VIC job), encode its picture, send it.
 static void _finish(Session* s)
 {
     if (!s->pending)
         return;
     s->pending = false;
     u64 vicNs = 0, waitNs = 0;
-    if (!VicEngineJobWait(&vicNs, &waitNs)) {
+    if (!s->jobCpu && !VicEngineJobWait(&vicNs, &waitNs)) {
         s->convFails++;
         return;
     }
     s->convs++;
     s->ivConvs++;
-    s->ivVicNs += vicNs;
-    s->ivVicWaitNs += waitNs;
-    if (s->jobTimed) {
-        const u32 q = s->jobAhead > 2 ? 2 : s->jobAhead, b = s->jobBacklog > 2 ? 2 : s->jobBacklog;
-        s->qN[q]++;
-        s->qNs[q] += vicNs;
-        s->bN[b]++;
-        s->bNs[b] += vicNs;
+    s->pictBad = false;
+    s->lastSrc = s->jobSrc;
+    s->haveLast = true;
+    if (!s->jobCpu) {
+        s->ivVicJobs++;
+        s->ivVicNs += vicNs;
+        s->ivVicWaitNs += waitNs;
     }
+    if (!s->jobCpu && s->jobTimed)
+        _ema(&s->eVic, vicNs, 3);
+    if (!s->jobCpu && s->pipe)  // what a pipelined frame costs the loop: read, the wait for the VIC, then the encode below
+        s->jobPipeNs += waitNs;
     const UvcTapPresent* p = &s->job;
     const u8* frame = NULL;
     u32 len = 0;
@@ -611,6 +786,9 @@ static void _finish(Session* s)
         return;
     }
     s->ivEncNs += encNs;
+    _ema(&s->eEnc, encNs, 3);
+    if (!s->jobCpu && s->pipe)
+        _ema(&s->ePipe, s->jobPipeNs + encNs, 3);
     s->needKey = false;
     _h264Append(s, frame, len);
     if (UvcDeviceSendFrame(frame, len, armTicksToNs(p->tick) / 1000000, idr)) {
@@ -630,12 +808,12 @@ static void _finish(Session* s)
     }
 }
 
-// One present: copy it into the slot copy the VIC is not reading, then a VIC
-// job straight into the encoder's picture (16-row block-linear). The job in
-// flight, if any, is collected (encoded, sent) after this copy - the copy
-// overlapped its conversion. Pipelined, this job is left in flight; otherwise
-// collected at once, as before. The fence was waited on. Returns whether a
-// job is left in flight.
+// One present: copy it into the slot copy the VIC is not reading, then make
+// the encoder's picture (16-row block-linear) from it - a VIC job, or the CPU
+// (MODE_CPU). The job in flight, if any, is collected (encoded, sent) after
+// this copy - the copy overlapped its conversion. Pipelined, this job is left
+// in flight; otherwise collected at once. The fence was waited on. Returns
+// whether a job is left in flight.
 static bool _convert(Session* s, const UvcTapPresent* p)
 {
     if (!NvencActive())
@@ -647,8 +825,47 @@ static bool _convert(Session* s, const UvcTapPresent* p)
     VicSource src;
     _source(s, p, &src);
     src.copy = s->pending ? s->jobCopy ^ 1 : 0;
-    u64 bytes = 0;
+    const bool cpu = s->mode == MODE_CPU && CpuCanConvert(&src) && _region(&src).readPerRow <= VicEngineBounceSize();
+    if (s->mode == MODE_CPU && !cpu)
+        s->ivCpuUnsup++;
     const u64 addr = _slotAddr(s, p->slot);
+    if (cpu) {
+        _finish(s);  // a VIC job still writing the picture (a mode change)
+        s->pictBad = true;  // written from here on
+        TornSamples ts;
+        u64 bytes = 0, readNs = 0, cpuNs = 0;
+        bool ok = _readConvert(s, addr, &src, &ts, &bytes, &readNs, &cpuNs);
+        if (!ok) {
+            s->convFails++;
+            return false;
+        }
+        if (_changedSinceSamples(s, addr, &src, &ts)) {
+            s->rereads++;
+            bytes = readNs = cpuNs = 0;
+            if (!_readConvert(s, addr, &src, &ts, &bytes, &readNs, &cpuNs) || _changedSinceSamples(s, addr, &src, &ts)) {
+                s->torn++;  // skip it: the P chain goes on from the last frame we encoded
+                return false;
+            }
+        }
+        s->ivCopies++;
+        s->ivReadNs += readNs;
+        s->ivReadBytes += bytes;
+        s->ivCpuN++;
+        s->ivCpuNs += cpuNs;
+        if (cpuNs > s->ivCpuMax)
+            s->ivCpuMax = cpuNs;
+        _ema(&s->eReadFused, readNs, 3);
+        _ema(&s->eCpu, cpuNs, 3);
+        s->job = *p;
+        s->jobSrc = src;
+        s->pending = true;
+        s->jobCpu = true;
+        s->jobTimed = false;
+        _finish(s);
+        return false;
+    }
+    _probeDrain(s);  // the VIC is ours again
+    u64 bytes = 0;
     const u64 t0 = _nowNs();
     bool ok = _readRegion(s, addr, &src, &bytes);
     if (!ok) {
@@ -667,6 +884,10 @@ static bool _convert(Session* s, const UvcTapPresent* p)
     s->ivCopies++;
     s->ivReadNs += t1 - t0;
     s->ivReadBytes += bytes;
+    _ema(&s->eReadCopy, t1 - t0, 3);
+    s->job = *p;
+    s->jobCopy = src.copy;
+    s->jobSrc = src;
     VicTarget t = { 0, 0, true };
     NvencPictureTarget(&t.lumaAddr, &t.chromaAddr);
     if (!VicEngineSubmitTo(&src, &t)) {
@@ -674,89 +895,182 @@ static bool _convert(Session* s, const UvcTapPresent* p)
         return false;
     }
     s->pending = true;
-    s->job = *p;
-    s->jobCopy = src.copy;
-    s->jobAhead = VicEngineJobAhead();
-    s->jobBacklog = s->pickBacklog;
-    s->jobTimed = !s->pipe;  // collected at once: its time is the job's
+    s->jobCpu = false;
+    s->jobPipeNs = t1 - t0;
+    s->jobTimed = !s->pipe;
     if (!s->pipe)
         _finish(s);
     return s->pending;
 }
 
-// The pipelining trial (TRIAL_*), while frames go to the camera
-static void _pipeControl(Session* s, const UvcTapPresent* p, bool encodeable)
+static void _setMode(Session* s, u32 mode)
 {
-    if (!VicEngineSlotCopy(1)) {
-        s->pipe = false;
+    s->mode = mode;
+    s->pipe = mode == MODE_PIPE;
+}
+
+static bool _cpuPossible(const Session* s)
+{
+    return s->haveLast && CpuCanConvert(&s->lastSrc) && _region(&s->lastSrc).readPerRow <= VicEngineBounceSize();
+}
+
+// Which modes this session can use: the CPU a frame it can convert (the last
+// one encoded), pipelining the second slot copy - and only where the CPU
+// cannot (MODE_* above)
+static bool _modeAvailable(const Session* s, u32 mode)
+{
+    return mode == MODE_VIC || (mode == MODE_CPU && _cpuPossible(s)) ||
+           (mode == MODE_PIPE && VicEngineSlotCopy(1) && !_cpuPossible(s));
+}
+
+// What a frame would cost in a mode (ns), from the steps' costs; 0 unknown.
+// Through dmnt:cht the slot copy costs an extra copy of ours: the piecewise
+// read was measured at ~2/3 of it (6 vs 9.5 ms).
+static u64 _predict(const Session* s, u32 mode)
+{
+    u64 copy = s->eReadCopy, fused = s->eReadFused;
+    if (!copy)
+        copy = s->dbg.dmnt ? fused * 3 / 2 : fused;
+    if (!fused)
+        fused = s->dbg.dmnt ? copy * 2 / 3 : copy;
+    if (!s->eEnc || !copy)
+        return 0;
+    switch (mode) {
+    case MODE_VIC:
+        return s->eVic ? copy + s->eVic + s->eEnc : 0;
+    case MODE_PIPE:
+        if (s->mode == MODE_PIPE && s->ePipe)
+            return s->ePipe;
+        return s->eVic ? (copy > s->eVic ? copy : s->eVic) + s->eEnc : 0;
+    default:
+        return s->eCpu ? fused + s->eCpu + s->eEnc : 0;
+    }
+}
+
+// The probes (MODE_*), while behind: a VIC job beside the CPU frames, or one
+// CPU conversion of the last frame on the VIC
+static void _probe(Session* s)
+{
+    const u64 now = _nowNs();
+    if (!s->pml[0] || s->pml[0] >= MODE_BEHIND_PML || now < s->nextProbe || s->pending || s->probing)
+        return;
+    if (s->mode == MODE_CPU) {
+        VicSource src = s->lastSrc;
+        src.copy = 0;  // whatever slot copy 0 holds: the probe measures the queue, not the picture
+        if (VicEngineActive() && VicEngineSubmitOwn(&src))
+            s->probing = true;
+        else
+            s->nextProbe = now + PROBE_EVERY_NS;
         return;
     }
+    s->nextProbe = now + PROBE_EVERY_NS;
+    // until PROBE_KEEP fresh ones; then one as each turns stale
+    if (!_cpuPossible(s) || _probesFresh(s->cpuPt, s->cpuPn) >= PROBE_KEEP)
+        return;
+    u8* out = VicEngineBounce();
+    const u8* slot = VicEngineSlotCopy(s->lastSrc.copy);
+    if (!out || !slot || VicEngineBounceSize() < VIC_OUT_BYTES)
+        return;
+    const u64 t0 = _nowNs();
+    if (CpuConvertNv12(slot, &s->lastSrc, out, out + VIC_OUT_LUMA, false)) {
+        s->eCpu = _probeAdd(s->cpuP, s->cpuPt, &s->cpuPn, _nowNs() - t0);
+        s->ivProbes++;
+        s->ivProbeNs += _nowNs() - t0;
+    }
+}
+
+// Every 2 s while frames go to the camera: the window's share of the game's
+// presents, then the check after a switch, or a switch
+static void _modeControl(Session* s, const UvcTapPresent* p, bool encodeable)
+{
+    if (!_modeAvailable(s, s->mode))
+        _setMode(s, MODE_VIC);
     const u64 now = _nowNs();
     if (!encodeable || s->sent == 0) {
-        if (s->trialWin) {  // the camera stopped: a trial must see a steady stream
-            s->trialWin = 0;
-            s->pipe = s->pipeKept;
-        }
         s->winStartNs = 0;
+        s->pml[0] = s->pml[1] = 0;
+        s->want = s->checkWin = 0;
         return;
     }
-    if (s->winStartNs && now - s->winStartNs < TRIAL_WINDOW_NS)
+    if (s->winStartNs && now - s->winStartNs < MODE_WINDOW_NS)
         return;
 
     // a window ends (none at the first call)
     const bool had = s->winStartNs != 0;
     const u64 span = now - s->winStartNs, pres = p->seq - s->winSeq, conv = s->convs - s->winConvs;
-    const bool steady = had && pres * 1000000000ULL >= TRIAL_MIN_FPS * span;
-    const u32 pml = pres ? (u32)(conv * 1000 / pres) : 1000;
     s->winStartNs = now;
     s->winSeq = p->seq;
     s->winConvs = s->convs;
     if (!had)
         return;
-
-    if (s->trialWin) {
-        s->trialPml[s->trialWin - 1] = steady ? (u16)pml : 0xFFFF;
-        if (steady) {
-            s->trialSum[s->pipe] += pml;
-            s->trialN[s->pipe]++;
-            s->trialFps[s->pipe] += (u32)(conv * 1000000000ULL / span);
-        }
-        if (s->trialWin < TRIAL_WINDOWS) {
-            s->pipe = kTrialPipe[s->trialWin++];
-            return;
-        }
-        char wins[TRIAL_WINDOWS * 8 + 1];
-        u32 len = 0;
-        for (u32 k = 0; k < TRIAL_WINDOWS; k++) {
-            if (s->trialPml[k] == 0xFFFF)
-                len += snprintf(wins + len, sizeof(wins) - len, " %c -", kTrialPipe[k] ? 'P' : 'S');
-            else
-                len += snprintf(wins + len, sizeof(wins) - len, " %c %u", kTrialPipe[k] ? 'P' : 'S', s->trialPml[k] / 10);
-        }
-        s->trialWin = 0;
-        if (s->trialN[0] < 2 || s->trialN[1] < 2) {
-            s->pipe = s->pipeKept;
-            s->nextTrialNs = now + TRIAL_RETRY_NS;
-            LOG("native: pipelining trial: too few steady windows (%%:%s) - keeping %s, again in %lu s\n",
-                wins, s->pipe ? "pipelined" : "one after the other", TRIAL_RETRY_NS / 1000000000ULL);
-            return;
-        }
-        const u32 m0 = s->trialSum[0] / s->trialN[0], m1 = s->trialSum[1] / s->trialN[1];
-        s->pipe = s->pipeKept = m1 * 100 > m0 * (100 + TRIAL_GAIN_PCT);
-        s->nextTrialNs = now + TRIAL_EVERY_NS;
-        LOG("native: pipelining trial (%%:%s): one after the other %u fps (%u%% of the game's frames), "
-            "pipelined %u fps (%u%%) -> %s, again in %lu s\n", wins,
-            s->trialFps[0] / s->trialN[0], m0 / 10, s->trialFps[1] / s->trialN[1], m1 / 10,
-            s->pipe ? "pipelined" : "one after the other", TRIAL_EVERY_NS / 1000000000ULL);
+    // steady: the game presents fast enough, at a stable rate. A loading
+    // screen or a scene change moves the share whatever the mode
+    // (01003ec027cc8000: a trial during loading had chosen wrongly)
+    const u32 rate = span ? (u32)(pres * 1000000000ULL / span) : 0;
+    const bool steady = rate >= MODE_MIN_FPS && s->lastRate &&
+                        rate * 100 >= s->lastRate * (100 - MODE_RATE_PCT) && rate * 100 <= s->lastRate * (100 + MODE_RATE_PCT);
+    s->lastRate = rate;
+    if (!steady) {
+        s->want = 0;
         return;
     }
+    const u32 pml = pres ? (u32)(conv * 1000 / pres) : 1000;
+    s->pml[1] = s->pml[0];
+    s->pml[0] = pml ? pml : 1;
 
-    // worth a trial: behind a steadily presenting game (or time to check the
-    // pipelined choice again)
-    if (steady && now >= s->nextTrialNs && (s->pipe || pml < TRIAL_BEHIND_PML)) {
-        s->trialSum[0] = s->trialSum[1] = s->trialN[0] = s->trialN[1] = s->trialFps[0] = s->trialFps[1] = 0;
-        s->pipe = kTrialPipe[s->trialWin++];
+    if (s->checkWin) {
+        if (--s->checkWin)
+            return;
+        const u32 now2 = s->pml[1] ? (s->pml[0] + s->pml[1]) / 2 : s->pml[0];
+        if (now2 * 100 < s->prevPml * (100 - MODE_CHECK_PCT)) {
+            // a load spike can fail a good mode (01003ec027cc8000 with cheats:
+            // 11% in a loading moment): a short block first, longer if it fails again
+            u64* b = &s->blockNs[s->mode];
+            *b = !*b ? MODE_BLOCK_NS : *b * 2 > MODE_BLOCK_MAX_NS ? MODE_BLOCK_MAX_NS : *b * 2;
+            LOG("native: mode %s: %u%% of the game's frames, %u%% before with %s - back to it, %s not again for %lu s\n",
+                kModeName[s->mode], now2 / 10, s->prevPml / 10, kModeName[s->prevMode], kModeName[s->mode],
+                *b / 1000000000ULL);
+            s->blockUntil[s->mode] = now + *b;
+            _setMode(s, s->prevMode);
+        } else {
+            s->blockNs[s->mode] = 0;
+            LOG("native: mode %s kept: %u%% of the game's frames (%u%% before with %s)\n",
+                kModeName[s->mode], now2 / 10, s->prevPml / 10, kModeName[s->prevMode]);
+        }
+        s->pml[0] = s->pml[1] = 0;  // the next windows are the new mode's
+        return;
     }
+    if (s->pml[0] >= MODE_BEHIND_PML) {
+        s->want = 0;
+        return;
+    }
+    const u64 cur = _predict(s, s->mode);
+    u32 best = s->mode;
+    u64 bestNs = cur;
+    for (u32 m = 0; m < MODES; m++) {
+        const u64 ns = _predict(s, m);
+        if (m != s->mode && ns && _modeAvailable(s, m) && now >= s->blockUntil[m] && (!bestNs || ns < bestNs)) {
+            best = m;
+            bestNs = ns;
+        }
+    }
+    if (best == s->mode || !cur || bestNs * (100 + MODE_GAIN_PCT) > cur * 100) {
+        s->want = 0;
+        return;
+    }
+    s->want = s->wantMode == best ? s->want + 1 : 1;
+    s->wantMode = best;
+    if (s->want < 2)
+        return;
+    LOG("native: mode %s -> %s: predicted %lu.%lu -> %lu.%lu ms a frame (%u%% of the game's frames now)\n",
+        kModeName[s->mode], kModeName[best], cur / 1000000, cur / 100000 % 10, bestNs / 1000000, bestNs / 100000 % 10,
+        s->pml[1] ? (s->pml[0] + s->pml[1]) / 20 : s->pml[0] / 10);
+    s->prevMode = s->mode;
+    s->prevPml = s->pml[1] ? (s->pml[0] + s->pml[1]) / 2 : s->pml[0];
+    s->want = 0;
+    s->checkWin = 3;  // the first window is the switch's own: then two of the new mode
+    s->pml[0] = s->pml[1] = 0;
+    _setMode(s, best);
 }
 
 static void _endSession(Session* s, const char* why)
@@ -991,6 +1305,7 @@ static void _dumpNv12(Session* s, const UvcTapPresent* p)
         return;
     }
     _finish(s);  // the VIC is ours, and so is slot copy 0
+    _probeDrain(s);
     VicSource src;
     _source(s, p, &src);
     u64 bytes = 0, vicNs = 0;
@@ -1052,17 +1367,21 @@ static void _logPeriodic(Session* s, const UvcTapPresent* p)
     if (VicEngineActive() || VicEngineWedged()) {
         VicEngineStats vs;
         VicEngineGetStats(&vs, true);
-        const u64 n = s->ivConvs ? s->ivConvs : 1, nc = s->ivCopies ? s->ivCopies : 1;
+        const u64 n = s->ivVicJobs ? s->ivVicJobs : 1, nc = s->ivCopies ? s->ivCopies : 1;
         LOG("native: presents last 10 s: %u already finished, %u waited for, %u newer skipped (vi-tap protocol %u); "
             "pipelined jobs: %u overlapped by the next copy, %u not\n",
             s->ivPickReady, s->ivPickWaited, s->ivSkipped, TapClientVersion(), s->ivOverlapped, s->ivAlone);
         LOG("native: VIC last 10 s: %u frames (%lu.%lu fps), per frame avg: fence wait %lu us (max %lu), read %lu KB in %lu us, "
-            "VIC %lu us (max %lu, waited for %lu) | %s | total %u, failed %u, fence timeouts %u%s\n",
+            "VIC %u jobs avg %lu us (max %lu, waited for %lu), CPU %u frames avg %lu us (max %lu)%s | mode %s%s | "
+            "total %u, failed %u, fence timeouts %u%s\n",
             s->ivConvs, (u64)s->ivConvs / 10, (u64)s->ivConvs % 10, s->ivFenceNs / (s->ivFences ? s->ivFences : 1) / 1000, s->ivFenceMax / 1000,
-            s->ivReadBytes / nc / 1024, s->ivReadNs / nc / 1000, s->ivVicNs / n / 1000, vs.nsMax / 1000, s->ivVicWaitNs / n / 1000,
-            !VicEngineSlotCopy(1) ? "one after the other (no second copy)" : s->trialWin ? "pipelining trial running" :
-            s->pipe ? "pipelined" : "one after the other",
+            s->ivReadBytes / nc / 1024, s->ivReadNs / nc / 1000, s->ivVicJobs, s->ivVicNs / n / 1000, vs.nsMax / 1000,
+            s->ivVicWaitNs / n / 1000, s->ivCpuN, s->ivCpuN ? s->ivCpuNs / s->ivCpuN / 1000 : 0, s->ivCpuMax / 1000,
+            s->ivCpuUnsup ? " (some frames not convertible: on the VIC)" : "",
+            kModeName[s->mode], s->checkWin ? " (just switched: checking)" : "",
             s->convs, s->convFails, s->fenceTimeouts, VicEngineWedged() ? " - ENGINE WEDGED" : "");
+        s->ivVicJobs = s->ivCpuN = s->ivCpuUnsup = 0;
+        s->ivCpuNs = s->ivCpuMax = 0;
         if (NvencActive() || NvencWedged()) {
             NvencStats es;
             NvencGetStats(&es, true);
@@ -1080,17 +1399,20 @@ static void _logPeriodic(Session* s, const UvcTapPresent* p)
                 es.frames > es.idrs ? es.bytesP / (es.frames - es.idrs) / 1024 : 0, es.errors,
                 es.clockHz / 1000000, NvencWedged() ? " - ENGINE WEDGED" : "");
         }
-#define AVG(ns, n) ((n) ? (ns) / (n) / 1000 : 0)
-        LOG("native: VIC queue (jobs collected at once): compositor work ahead at submit 0: %u jobs avg %lu us | "
-            "1: %u avg %lu us | 2+: %u avg %lu us; game frames the GPU had not finished 0: %u avg %lu us | "
-            "1: %u avg %lu us | 2+: %u avg %lu us\n",
-            s->qN[0], AVG(s->qNs[0], s->qN[0]), s->qN[1], AVG(s->qNs[1], s->qN[1]), s->qN[2], AVG(s->qNs[2], s->qN[2]),
-            s->bN[0], AVG(s->bNs[0], s->bN[0]), s->bN[1], AVG(s->bNs[1], s->bN[1]), s->bN[2], AVG(s->bNs[2], s->bN[2]));
-#undef AVG
-        memset(s->qN, 0, sizeof(s->qN));
-        memset(s->bN, 0, sizeof(s->bN));
-        memset(s->qNs, 0, sizeof(s->qNs));
-        memset(s->bNs, 0, sizeof(s->bNs));
+        char pred[160];
+        u32 pl = 0;
+        for (u32 m = 0; m < MODES; m++) {
+            const u64 ns = _modeAvailable(s, m) ? _predict(s, m) : 0;
+            if (ns)
+                pl += snprintf(pred + pl, sizeof(pred) - pl, "%s%s %lu.%lu", pl ? ", " : "", kModeName[m],
+                               ns / 1000000, ns / 100000 % 10);
+        }
+        if (!pl)
+            snprintf(pred, sizeof(pred), "not known yet");
+        LOG("native: mode %s, predicted ms a frame: %s | last share of the game's frames %u%% | probes last 10 s: %u, avg %lu us\n",
+            kModeName[s->mode], pred, s->pml[0] / 10, s->ivProbes, s->ivProbes ? s->ivProbeNs / s->ivProbes / 1000 : 0);
+        s->ivProbes = 0;
+        s->ivProbeNs = 0;
         s->ivConvs = 0;
         s->ivReadNs = s->ivVicNs = s->ivFenceNs = s->ivFenceMax = s->ivReadBytes = 0;
         s->ivFences = s->ivCopies = 0;
@@ -1108,6 +1430,8 @@ static void _filler(Session* s)
     const u8* frame = NULL;
     u32 len = 0;
     bool idr = false;
+    if (s->pictBad)
+        return;  // a frame the game drew over: the next one comes, do not show this one
     if (s->attached && s->locked && NvencActive() && s->convs > 0 && !s->needKey) {
         // the encoder's picture still holds the last frame: the same again
         if (!NvencEncode(false, &frame, &len, &idr, NULL))
@@ -1221,8 +1545,10 @@ void NativeCaptureThread(void* arg)
             }
         }
 
-        if (s->attached)
-            _pipeControl(s, &p, s->locked && NvencActive() && UvcDeviceIsStreaming());
+        if (s->attached) {
+            _probePoll(s);
+            _modeControl(s, &p, s->locked && NvencActive() && UvcDeviceIsStreaming());
+        }
 
         bool inFlight = false;  // a job submitted in this pass, its collection overlapping the next copy
         if (s->attached && ((woke && p.seq != s->lastSeq) || again)) {
@@ -1282,6 +1608,8 @@ void NativeCaptureThread(void* arg)
             s->ivAlone++;
             _finish(s);
         }
+        if (s->attached && s->locked && NvencActive() && UvcDeviceIsStreaming())
+            _probe(s);
 
 #if NATIVE_DEBUG
         // suspended (HOME): its buffers hold still - dump the one on screen

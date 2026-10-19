@@ -36,6 +36,9 @@ bool NvencWedged(void);
 
 // Where the VIC writes the picture to encode (VIC device addresses).
 void NvencPictureTarget(u32* lumaAddr, u32* chromaAddr);
+// The same picture for the CPU (cached: flush what you write), in the same
+// 16-row block-linear layout.
+void NvencPictureCpu(u8** luma, u8** chroma, u32* lumaBytes, u32* chromaBytes);
 
 // Encodes the picture: an IDR when idr (or when the chain is broken),
 // else a P frame. On success *data/*len is one access unit, SPS/PPS

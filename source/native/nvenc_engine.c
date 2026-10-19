@@ -278,6 +278,14 @@ void NvencClose(void)
 bool NvencActive(void) { return g_open && !g_wedged; }
 bool NvencWedged(void) { return g_wedged; }
 
+void NvencPictureCpu(u8** luma, u8** chroma, u32* lumaBytes, u32* chromaBytes)
+{
+    *luma = g_a ? g_a + A_CUR : NULL;
+    *chroma = g_a ? g_a + A_CUR_UV : NULL;
+    *lumaBytes = A_LUMA;
+    *chromaBytes = A_CHROMA;
+}
+
 void NvencPictureTarget(u32* lumaAddr, u32* chromaAddr)
 {
     *lumaAddr = g_vicAddr ? g_vicAddr + A_CUR : 0;

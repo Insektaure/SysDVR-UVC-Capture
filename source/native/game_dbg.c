@@ -128,6 +128,24 @@ bool GameDbgRead(GameDbg* d, void* dst, u64 va, size_t len)
     return R_SUCCEEDED(rc);
 }
 
+bool GameDbgReadTo(GameDbg* d, void* dst, u64 va, size_t len)
+{
+    if (!d->dmnt)
+        return R_SUCCEEDED(svcReadDebugProcessMemory(dst, d->handle, va, len));
+    Result rc = 0;
+    mutexLock(&g_chtLock);
+    for (size_t off = 0; off < len && R_SUCCEEDED(rc); off += 0x200000) {
+        const size_t n = len - off < 0x200000 ? len - off : 0x200000;
+        const struct { u64 address; u64 size; } in = { va + off, n };
+        rc = serviceDispatchIn(&g_cht, DMNT_CHT_READ_MEMORY, in,
+            .buffer_attrs = { SfBufferAttr_Out | SfBufferAttr_HipcMapAlias },
+            .buffers = { { (u8*)dst + off, n } },
+        );
+    }
+    mutexUnlock(&g_chtLock);
+    return R_SUCCEEDED(rc);
+}
+
 bool GameDbgQuery(GameDbg* d, MemoryInfo* mi, u64 addr)
 {
     if (!d->dmnt) {
