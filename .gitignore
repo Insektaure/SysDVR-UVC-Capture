@@ -16,3 +16,4 @@ builddir
 !.github/
 .idea/*
 external/*
+dist/
