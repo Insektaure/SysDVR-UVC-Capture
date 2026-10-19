@@ -10,7 +10,8 @@
 //   game stops presenting (HOME pressed: suspended, its buffers still), dump
 //   the slot on screen -> detach when the game goes or changes.
 //
-// Built only with -DNATIVE_PROBE.
+// Default build (-DNATIVE_CAPTURE, Makefile CAPTURE=native); grc:d is not
+// used at all in this build.
 #include <stdio.h>
 #include <string.h>
 #include "../core.h"
@@ -22,13 +23,13 @@
 #include "vic_engine.h"
 #include "nvenc_engine.h"
 #include "../uvc/uvc_device.h"
-#include "native_probe.h"
+#include "native_capture.h"
 
-#ifdef NATIVE_PROBE
+#ifdef NATIVE_CAPTURE
 
-#if !LOGGING_ENABLED
-#error "NATIVE_PROBE reports only through the log: build with -DFILE_LOGGING (or -DUDP_LOGGING)"
-#endif
+// Debug features (logging builds only): a whole-slot read every second
+// (throughput), and on HOME a dump of the frame on screen to the SD card.
+#define NATIVE_DEBUG LOGGING_ENABLED
 
 #define SIG_POINTS        32
 #define SAMPLE_DELAY_NS   8000000ULL   // without the engine (no nvdrv): no fence wait, let the GPU finish
@@ -43,11 +44,8 @@
 #define ENCODE_QP         20           // SFT: constant QP 20 (P frames 22)
 #define H264_DUMP_FRAMES  0            // 3a wrote the first N frames to <program>.h264; off while streaming (SD writes cost latency)
 
-extern volatile bool g_nativeProbeRunning;
+extern volatile bool g_nativeCaptureRunning;
 
-// True while native frames go to the UVC endpoint: the video thread leaves
-// grc:d alone (main.c)
-volatile bool g_nativeStreaming = false;
 
 static u8 alignas(0x1000) g_chunk[CHUNK];
 
@@ -130,6 +128,7 @@ static bool _sdOpen(void)
     return true;
 }
 
+#if NATIVE_DEBUG
 static bool _sdWrite(const char* path, const void* data, size_t size)
 {
     if (!_sdOpen())
@@ -144,6 +143,7 @@ static bool _sdWrite(const char* path, const void* data, size_t size)
     fsFileClose(&f);
     return R_SUCCEEDED(rc);
 }
+#endif
 
 // ============================================================================
 // Finding the slot buffers
@@ -354,7 +354,6 @@ static void _releaseMemory(Session* s)
 {
     if (!s->mem)
         return;
-    g_nativeStreaming = false;
     GameDbgSetBounce(NULL, 0);
     NvencClose();
     VicEngineClose();
@@ -603,6 +602,7 @@ static void _calibrate(Session* s, const UvcTapPresent* p)
     }
 }
 
+#if NATIVE_DEBUG
 // Whole slot in CHUNK pieces, discarded: throughput, and reads in flight
 // for the kill test.
 static void _throughputRead(Session* s, s32 slot)
@@ -726,6 +726,7 @@ static void _dumpNv12(Session* s, const UvcTapPresent* p)
         n, VIC_OUT_W, VIC_OUT_H, src.rect_w, src.rect_h, src.flip, bytes / 1024, readNs / 1000, vicNs / 1000,
         saved ? "saved" : "FAILED");
 }
+#endif
 
 static void _logPeriodic(Session* s, const UvcTapPresent* p)
 {
@@ -774,17 +775,17 @@ static void _logPeriodic(Session* s, const UvcTapPresent* p)
     }
 }
 
-void NativeProbeThread(void* arg)
+void NativeCaptureThread(void* arg)
 {
     (void)arg;
-    LOG("native: probe started (phase 3b: native H.264 720p to the UVC camera while an app streams)\n");
+    LOG("native: capture started (native H.264 720p to the camera while an app streams)\n");
     DonorCleanupStale();
     Session* s = &g_s;
     memset(s, 0, sizeof(*s));
     u64 lastLog = _nowNs();
     u64 failedPid = 0, failedGen = 0;
 
-    while (g_nativeProbeRunning) {
+    while (g_nativeCaptureRunning) {
         if (!TapClientIsConnected()) {
             if (R_FAILED(TapClientConnect())) {
                 svcSleepThread(2000000000ULL);
@@ -832,46 +833,50 @@ void NativeProbeThread(void* arg)
         }
 
         if (s->attached && woke && p.seq != s->lastSeq) {
-            if (VicEngineActive()) {
-                // the present's acquire fence: the GPU may still be drawing
-                // the slot when the game queues it
-                u64 waited = 0;
-                if (!VicEngineWaitFence(p.fence_count, p.fence, FENCE_TIMEOUT_NS, &waited))
-                    s->fenceTimeouts++;
-                s->ivFenceNs += waited;
-                if (waited > s->ivFenceMax)
-                    s->ivFenceMax = waited;
-            } else {
-                const u64 due = armTicksToNs(p.tick) + SAMPLE_DELAY_NS;
-                const u64 now = _nowNs();
-                if (due > now)
-                    svcSleepThread(due - now);
+            const bool streaming = UvcDeviceIsStreaming();
+            // per frame work only while matching the buffers, or while a
+            // camera app streams: otherwise the game pays nothing
+            const bool encode = s->locked && NvencActive() && streaming;
+            if (!s->locked || encode) {
+                if (VicEngineActive()) {
+                    // the present's acquire fence: the GPU may still be
+                    // drawing the slot when the game queues it
+                    u64 waited = 0;
+                    if (!VicEngineWaitFence(p.fence_count, p.fence, FENCE_TIMEOUT_NS, &waited))
+                        s->fenceTimeouts++;
+                    s->ivFenceNs += waited;
+                    if (waited > s->ivFenceMax)
+                        s->ivFenceMax = waited;
+                } else {
+                    const u64 due = armTicksToNs(p.tick) + SAMPLE_DELAY_NS;
+                    const u64 now = _nowNs();
+                    if (due > now)
+                        svcSleepThread(due - now);
+                }
+                _calibrate(s, &p);
             }
-            _calibrate(s, &p);
             s->lastSeq = p.seq;
 
-            const bool streaming = UvcDeviceIsStreaming();
             if (s->locked && NvencActive()) {
-                // encode only while a camera app streams: the game pays nothing otherwise
                 if (streaming && !s->wasStreaming) {
-                    s->needKey = true;
+                    s->needKey = true;  // a new stream starts on a keyframe
                     LOG("native: a camera app is streaming - native H.264 720p from now on\n");
                 } else if (!streaming && s->wasStreaming) {
                     LOG("native: the camera app stopped streaming\n");
                 }
                 s->wasStreaming = streaming;
-                g_nativeStreaming = streaming;
-                if (streaming)
-                    _convert(s, &p, true);
-            } else if (s->locked && VicEngineActive()) {
-                g_nativeStreaming = false;
-                _convert(s, &p, false);
-            } else if (s->locked && _nowNs() >= s->nextRead) {
+            }
+            if (encode)
+                _convert(s, &p, true);
+#if NATIVE_DEBUG
+            else if (s->locked && !NvencActive() && _nowNs() >= s->nextRead) {
                 _throughputRead(s, p.slot);
                 s->nextRead = _nowNs() + READ_EVERY_NS;
             }
+#endif
         }
 
+#if NATIVE_DEBUG
         // suspended (HOME): its buffers hold still - dump the one on screen
         if (s->attached && s->locked && !woke && p.seq != 0 && p.seq != s->dumpedSeq &&
             s->dumps < DUMPS_PER_SESSION && p.process_id == s->dbg.pid &&
@@ -882,6 +887,7 @@ void NativeProbeThread(void* arg)
             else
                 _dump(s, &p);
         }
+#endif
 
         if (s->mem && _nowNs() >= s->nextYieldCheck) {
             s->nextYieldCheck = _nowNs() + 1000000000ULL;

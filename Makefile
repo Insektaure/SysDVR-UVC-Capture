@@ -28,8 +28,22 @@ INCLUDES	:=	include
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
+# Video source:
+#   native (default) - the game's own frames: vi-tap, the donor, VIC + NVENC,
+#                      720p at the game's frame rate (docs/NATIVE-CAPTURE.md)
+#   grcd             - the console's recorder (grc:d): 720p30, no vi-tap or
+#                      donor needed (the 1.0.1 behaviour)
+CAPTURE ?= native
+ifeq ($(CAPTURE),native)
+CAPTURE_DEFINES := -DNATIVE_CAPTURE
+else ifeq ($(CAPTURE),grcd)
+CAPTURE_DEFINES :=
+else
+$(error CAPTURE must be native or grcd)
+endif
+
 CFLAGS	:=	-g -Wall -Werror -O3 -ffunction-sections \
-			$(ARCH) $(DEFINES)
+			$(ARCH) $(DEFINES) $(CAPTURE_DEFINES)
 
 CFLAGS	+=	$(INCLUDE) -D__SWITCH__
 

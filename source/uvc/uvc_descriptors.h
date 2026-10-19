@@ -401,11 +401,11 @@ typedef struct __attribute__((packed)) {
 #define UVC_H264_MAX_FRAME_SIZE 0x54000
 
 // What the camera advertises. The grc:d stream is 720p30. The native capture
-// (docs/NATIVE-CAPTURE.md, -DNATIVE_PROBE) sends the game's own frame rate,
+// (docs/NATIVE-CAPTURE.md, the default build) sends the game's own frame rate,
 // up to 60, and its keyframes are larger: Linux uvcvideo sizes its buffers
 // from dwMaxVideoFrameSize, so it must hold the largest frame NVENC may write
 // (SPS/PPS + a 1.4 MB bitstream buffer).
-#ifdef NATIVE_PROBE
+#ifdef NATIVE_CAPTURE
 #define UVC_STREAM_FRAME_INTERVAL UVC_FRAME_INTERVAL_60FPS
 #define UVC_STREAM_MAX_FRAME_SIZE 0x180000
 #define UVC_STREAM_MIN_BITRATE    UVC_MIN_BITRATE

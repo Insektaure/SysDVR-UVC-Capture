@@ -14,7 +14,11 @@
     #define LOG(...) do { LogFunctionImpl(__VA_ARGS__); } while (0)
     #define LOGGING_STACK_BOOST 0x1000
 #else
-    #define LOG(...) do { } while (0)
+    // Arguments still evaluated (and so "used"): code that computes values
+    // only for its log lines compiles the same without logging. Cheap, and
+    // the optimizer drops what has no side effect.
+    static inline void LogNop(const char* fmt, ...) { (void)fmt; }
+    #define LOG(...) LogNop(__VA_ARGS__)
     #define LOGGING_STACK_BOOST 0
 #endif
 

@@ -5,7 +5,7 @@
 #include "../capture.h"
 #include "../uvc/uvc_device.h"
 #include "../tap_client.h"
-#include "../native/native_probe.h"
+#include "../native/native_capture.h"
 
 // ============================================================================
 // libnx Sysmodule Configuration
@@ -38,9 +38,13 @@ void __libnx_initheap(void)
 #define STREAM_THREAD_PRIORITY  0x2C
 
 static Thread g_videoThread;
+#ifndef NATIVE_CAPTURE
 static Thread g_audioThread;
+#endif
 static u8 alignas(0x1000) g_videoThreadStack[VIDEO_THREAD_STACK_SIZE];
+#ifndef NATIVE_CAPTURE
 static u8 alignas(0x1000) g_audioThreadStack[AUDIO_THREAD_STACK_SIZE];
+#endif
 
 static volatile bool g_running = true;
 
@@ -53,14 +57,13 @@ static u8 alignas(0x1000) g_tapProbeStack[TAP_PROBE_STACK_SIZE];
 volatile bool g_tapProbeRunning = true;
 #endif
 
-#ifdef NATIVE_PROBE
-// Phase 2a: attach to the game, find its swapchain, read and dump frames
-#define NATIVE_PROBE_STACK_SIZE (0x4000 + LOGGING_STACK_BOOST)
-#define NATIVE_PROBE_PRIORITY   0x3B
-static Thread g_nativeProbeThread;
-static u8 alignas(0x1000) g_nativeProbeStack[NATIVE_PROBE_STACK_SIZE];
-volatile bool g_nativeProbeRunning = true;
-extern volatile bool g_nativeStreaming;  // native_probe.c: native frames are going out
+#ifdef NATIVE_CAPTURE
+// The native capture: the game's frames through VIC + NVENC to the camera
+#define NATIVE_CAPTURE_STACK_SIZE (0x4000 + LOGGING_STACK_BOOST)
+#define NATIVE_CAPTURE_PRIORITY   0x3B
+static Thread g_nativeCaptureThread;
+static u8 alignas(0x1000) g_nativeCaptureStack[NATIVE_CAPTURE_STACK_SIZE];
+volatile bool g_nativeCaptureRunning = true;
 #endif
 
 // ============================================================================
@@ -103,33 +106,23 @@ static void VideoStreamThread(void* arg)
         // are synchronous and share buffers, so a second caller would race.
         UvcDeviceProcessRequests();
 
+#ifdef NATIVE_CAPTURE
+        // Native only: the native capture thread encodes and sends the
+        // frames. This thread serves EP0 (probe/commit) and never opens
+        // grc:d (build with CAPTURE=grcd for the console's recorder).
+        (void)frame;
+        svcSleepThread(5E+6);
+#else
         if (!UvcDeviceIsStreaming()) {
             svcSleepThread(50E+6);  // 50ms
             continue;
         }
-
-#ifdef NATIVE_PROBE
-        // the native capture sends the frames: grc:d stays idle, this thread
-        // keeps serving EP0
-        if (g_nativeStreaming) {
-            svcSleepThread(5E+6);
-            continue;
-        }
-#endif
 
         // Blocks until grc:d produces a frame - this is the loop's pacing
         if (!CaptureReadVideoFrame(&frame)) {
             svcSleepThread(16E+6);  // ~one frame
             continue;
         }
-
-#ifdef NATIVE_PROBE
-        // the native stream started while grc:d was blocked: drop this frame
-        // (a grc:d P frame in the native stream would corrupt it until the
-        // next keyframe)
-        if (g_nativeStreaming)
-            continue;
-#endif
 
         bool sent = UvcDeviceSendFrame(
             frame.Data,
@@ -140,11 +133,13 @@ static void VideoStreamThread(void* arg)
         if (!sent) {
             LOG("Failed to send video frame\n");
         }
+#endif
     }
 
     LOG("Video stream thread exiting\n");
 }
 
+#ifndef NATIVE_CAPTURE
 // ============================================================================
 // Audio Streaming Thread
 // ============================================================================
@@ -209,6 +204,7 @@ static void AudioStreamThread(void* arg)
 
     LOG("Audio stream thread exiting\n");
 }
+#endif
 
 // ============================================================================
 // Sysmodule Lifecycle
@@ -290,20 +286,22 @@ int main(int argc, char* argv[])
                  g_videoThreadStack, VIDEO_THREAD_STACK_SIZE,
                  STREAM_THREAD_PRIORITY);
 
-    // Launch audio streaming thread
+#ifndef NATIVE_CAPTURE
+    // Launch audio streaming thread (grc:d; idle while UAC is impossible)
     LaunchThread(&g_audioThread, AudioStreamThread, NULL,
                  g_audioThreadStack, AUDIO_THREAD_STACK_SIZE,
                  STREAM_THREAD_PRIORITY);
+#endif
 
 #ifdef TAP_PROBE
     LaunchThread(&g_tapProbeThread, TapProbeThread, NULL,
                  g_tapProbeStack, TAP_PROBE_STACK_SIZE,
                  TAP_PROBE_PRIORITY);
 #endif
-#ifdef NATIVE_PROBE
-    LaunchThread(&g_nativeProbeThread, NativeProbeThread, NULL,
-                 g_nativeProbeStack, NATIVE_PROBE_STACK_SIZE,
-                 NATIVE_PROBE_PRIORITY);
+#ifdef NATIVE_CAPTURE
+    LaunchThread(&g_nativeCaptureThread, NativeCaptureThread, NULL,
+                 g_nativeCaptureStack, NATIVE_CAPTURE_STACK_SIZE,
+                 NATIVE_CAPTURE_PRIORITY);
 #endif
 
     LOG("SysDVR-UVC running (video + audio)\n");
@@ -315,14 +313,16 @@ int main(int argc, char* argv[])
 
     g_running = false;
     JoinThread(&g_videoThread);
+#ifndef NATIVE_CAPTURE
     JoinThread(&g_audioThread);
+#endif
 #ifdef TAP_PROBE
     g_tapProbeRunning = false;
     JoinThread(&g_tapProbeThread);
 #endif
-#ifdef NATIVE_PROBE
-    g_nativeProbeRunning = false;
-    JoinThread(&g_nativeProbeThread);
+#ifdef NATIVE_CAPTURE
+    g_nativeCaptureRunning = false;
+    JoinThread(&g_nativeCaptureThread);
 #endif
     UvcDeviceExit();
 

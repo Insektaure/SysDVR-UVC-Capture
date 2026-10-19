@@ -169,11 +169,15 @@ Result CoreInit(void)
 
     LOG("Serial: %s\n", g_serialNumber);
 
+#ifndef NATIVE_CAPTURE
+    // grc:d only in the grc:d build: the native build never opens it (and so
+    // never competes with SysDVR for it)
     rc = CaptureInitialize();
     if (R_FAILED(rc)) {
         LOG("CaptureInitialize failed: 0x%x\n", rc);
         return rc;
     }
+#endif
 
     g_coreInitialized = true;
     LOG("Core initialization complete\n");
@@ -186,7 +190,9 @@ void CoreExit(void)
         return;
     }
 
+#ifndef NATIVE_CAPTURE
     CaptureFinalize();
+#endif
 
 #if UDP_LOGGING
     if (g_logSocket >= 0) {
