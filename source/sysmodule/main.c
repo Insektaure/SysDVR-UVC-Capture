@@ -4,6 +4,7 @@
 #include "../core.h"
 #include "../capture.h"
 #include "../uvc/uvc_device.h"
+#include "../tap_client.h"
 
 // ============================================================================
 // libnx Sysmodule Configuration
@@ -41,6 +42,15 @@ static u8 alignas(0x1000) g_videoThreadStack[VIDEO_THREAD_STACK_SIZE];
 static u8 alignas(0x1000) g_audioThreadStack[AUDIO_THREAD_STACK_SIZE];
 
 static volatile bool g_running = true;
+
+#ifdef TAP_PROBE
+// Phase 1 spike: reads vi-tap's present records and logs them (no capture)
+#define TAP_PROBE_STACK_SIZE (0x2000 + LOGGING_STACK_BOOST)
+#define TAP_PROBE_PRIORITY   0x3B
+static Thread g_tapProbeThread;
+static u8 alignas(0x1000) g_tapProbeStack[TAP_PROBE_STACK_SIZE];
+volatile bool g_tapProbeRunning = true;
+#endif
 
 // ============================================================================
 // USB Device Configuration
@@ -253,6 +263,12 @@ int main(int argc, char* argv[])
                  g_audioThreadStack, AUDIO_THREAD_STACK_SIZE,
                  STREAM_THREAD_PRIORITY);
 
+#ifdef TAP_PROBE
+    LaunchThread(&g_tapProbeThread, TapProbeThread, NULL,
+                 g_tapProbeStack, TAP_PROBE_STACK_SIZE,
+                 TAP_PROBE_PRIORITY);
+#endif
+
     LOG("SysDVR-UVC running (video + audio)\n");
 
     // Main thread just sleeps - all work is done in streaming threads
@@ -263,6 +279,10 @@ int main(int argc, char* argv[])
     g_running = false;
     JoinThread(&g_videoThread);
     JoinThread(&g_audioThread);
+#ifdef TAP_PROBE
+    g_tapProbeRunning = false;
+    JoinThread(&g_tapProbeThread);
+#endif
     UvcDeviceExit();
 
     LOG("SysDVR-UVC exiting\n");

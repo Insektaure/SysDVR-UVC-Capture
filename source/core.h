@@ -29,8 +29,8 @@
 // Version Information
 // ============================================================================
 
-#define SYSDVR_UVC_VERSION "1.0.0"
-#define SYSDVR_UVC_VERSION_NUM 0x010000
+#define SYSDVR_UVC_VERSION "1.0.1"
+#define SYSDVR_UVC_VERSION_NUM 0x010001
 
 // ============================================================================
 // Core API
