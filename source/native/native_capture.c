@@ -132,6 +132,15 @@ typedef struct {
     bool   pictBad;          // the encoder's picture holds a torn or partial frame: not to be re-sent
     u32    ivVicJobs, ivCpuN, ivCpuUnsup;
     u64    ivCpuNs, ivCpuMax;
+    // where a CPU frame's time goes (logging builds): the conversion (wall
+    // clock, and what the thread actually ran), the flush; and once a second
+    // the last piece converted again while it is still in the cache, tiled
+    // (NVENC's layout) and in row order, and only read
+    u64    ivConvNs, ivConvRunNs, ivFlushNs;
+    u64    nextHot, hotOff, hotBl, hotPitch, hotRead;
+    u32    hotFirst, hotEnd, hotN, hotLines;
+    VicSource hotSrc;
+    bool   hotOk;
     bool   jobTimed;         // collected at once: its time is the job's
 
     // the mode (MODE_*)
@@ -694,7 +703,21 @@ static u64 _sampleOff(const Region* r, u32 k)
     return (k % r->rows) * r->rowBytes + (((u64)k * 0x2340u % r->readPerRow) & ~63ULL);
 }
 
-static bool _readConvert(Session* s, u64 addr, const VicSource* src, TornSamples* ts, u64* bytes, u64* readNs, u64* cpuNs)
+#if NATIVE_DEBUG
+// The time this thread has run, all cores (ns): against the wall clock, what
+// other threads on our core took
+static u64 _runNs(void)
+{
+    u64 t = 0;
+    svcGetInfo(&t, InfoType_ThreadTickCount, CUR_THREAD_HANDLE, TickCountInfo_Total);
+    return armTicksToNs(t);
+}
+#endif
+
+typedef struct { u64 conv, run, flush; } CpuSplit;
+
+static bool _readConvert(Session* s, u64 addr, const VicSource* src, TornSamples* ts, u64* bytes, u64* readNs, u64* cpuNs,
+                         CpuSplit* sp)
 {
     const Region r = _region(src);
     u8* chunk = VicEngineBounce();
@@ -723,15 +746,31 @@ static bool _readConvert(Session* s, u64 addr, const VicSource* src, TornSamples
             }
         }
         const u32 first = (u32)br * lines, end = first + lines < VIC_OUT_H ? first + lines : VIC_OUT_H;
+#if NATIVE_DEBUG
+        const u64 r0 = _runNs();
+#endif
         if (first < VIC_OUT_H && !CpuConvertRows(chunk, off, src, first, end, luma, chroma, true))
             return false;
-        *cpuNs += _nowNs() - t1;
+        const u64 t2 = _nowNs();
+        *cpuNs += t2 - t1;
+        sp->conv += t2 - t1;
+#if NATIVE_DEBUG
+        sp->run += _runNs() - r0;
+#endif
+        if (first < VIC_OUT_H && end > first) {  // the piece the diagnostic converts again
+            s->hotOff = off;
+            s->hotFirst = first;
+            s->hotEnd = end;
+            s->hotSrc = *src;
+            s->hotOk = true;
+        }
         _probePoll(s);
     }
     const u64 t2 = _nowNs();
     armDCacheFlush(luma, lumaBytes);  // NVENC reads it from memory
     armDCacheFlush(chroma, chromaBytes);
     *cpuNs += _nowNs() - t2;
+    sp->flush += _nowNs() - t2;
     return true;
 }
 
@@ -833,8 +872,9 @@ static bool _convert(Session* s, const UvcTapPresent* p)
         _finish(s);  // a VIC job still writing the picture (a mode change)
         s->pictBad = true;  // written from here on
         TornSamples ts;
+        CpuSplit sp = { 0, 0, 0 };
         u64 bytes = 0, readNs = 0, cpuNs = 0;
-        bool ok = _readConvert(s, addr, &src, &ts, &bytes, &readNs, &cpuNs);
+        bool ok = _readConvert(s, addr, &src, &ts, &bytes, &readNs, &cpuNs, &sp);
         if (!ok) {
             s->convFails++;
             return false;
@@ -842,7 +882,8 @@ static bool _convert(Session* s, const UvcTapPresent* p)
         if (_changedSinceSamples(s, addr, &src, &ts)) {
             s->rereads++;
             bytes = readNs = cpuNs = 0;
-            if (!_readConvert(s, addr, &src, &ts, &bytes, &readNs, &cpuNs) || _changedSinceSamples(s, addr, &src, &ts)) {
+            sp.conv = sp.run = sp.flush = 0;
+            if (!_readConvert(s, addr, &src, &ts, &bytes, &readNs, &cpuNs, &sp) || _changedSinceSamples(s, addr, &src, &ts)) {
                 s->torn++;  // skip it: the P chain goes on from the last frame we encoded
                 return false;
             }
@@ -856,6 +897,9 @@ static bool _convert(Session* s, const UvcTapPresent* p)
             s->ivCpuMax = cpuNs;
         _ema(&s->eReadFused, readNs, 3);
         _ema(&s->eCpu, cpuNs, 3);
+        s->ivConvNs += sp.conv;
+        s->ivConvRunNs += sp.run;
+        s->ivFlushNs += sp.flush;
         s->job = *p;
         s->jobSrc = src;
         s->pending = true;
@@ -1348,6 +1392,42 @@ static void _dumpNv12(Session* s, const UvcTapPresent* p)
 }
 #endif
 
+#if NATIVE_DEBUG
+// The last piece of the last CPU frame, still in the bounce buffer, converted
+// again: tiled and in row order into the slot copy (unused in CPU mode), and
+// only read. Every output is written cold, as the encoder's picture is (it is
+// flushed every frame).
+static void _hotRerun(Session* s)
+{
+    const u8* chunk = VicEngineBounce();
+    u8* scratch = VicEngineSlotCopy(0);
+    const Region r = _region(&s->hotSrc);
+    if (!s->hotOk || !chunk || !scratch || r.readPerRow > VicEngineBounceSize() ||
+        (u64)s->surf.buf_size < 0x400000 + VIC_OUT_W * 368)
+        return;
+    u8* y = scratch;
+    u8* uv = scratch + 0x400000;  // past any luma offset, tiled or not
+    u64 t0 = _nowNs();
+    u64 sum = 0;
+    const u64* w = (const u64*)chunk;
+    for (u64 i = 0; i < r.readPerRow / 8; i += 8)  // one load a cache line... and the rest of the line
+        sum += w[i] ^ w[i + 1] ^ w[i + 2] ^ w[i + 3] ^ w[i + 4] ^ w[i + 5] ^ w[i + 6] ^ w[i + 7];
+    const u64 t1 = _nowNs();
+    const bool ok = CpuConvertRows(chunk, s->hotOff, &s->hotSrc, s->hotFirst, s->hotEnd, y, uv, true);
+    const u64 t2 = _nowNs();
+    const bool ok2 = CpuConvertRows(chunk, s->hotOff, &s->hotSrc, s->hotFirst, s->hotEnd, y, uv, false);
+    const u64 t3 = _nowNs();
+    armDCacheFlush(scratch, 0x400000 + VIC_OUT_W * 368);  // what the VIC probe may read: no dirty line left
+    if (!ok || !ok2 || sum == 0x5A5A5A5A5A5A5A5AULL)  // (sum: keep the loop)
+        return;
+    s->hotRead += t1 - t0;
+    s->hotBl += t2 - t1;
+    s->hotPitch += t3 - t2;
+    s->hotLines = s->hotEnd - s->hotFirst;
+    s->hotN++;
+}
+#endif
+
 static void _logPeriodic(Session* s, const UvcTapPresent* p)
 {
     DebugPumpStats ps;
@@ -1380,6 +1460,21 @@ static void _logPeriodic(Session* s, const UvcTapPresent* p)
             s->ivCpuUnsup ? " (some frames not convertible: on the VIC)" : "",
             kModeName[s->mode], s->checkWin ? " (just switched: checking)" : "",
             s->convs, s->convFails, s->fenceTimeouts, VicEngineWedged() ? " - ENGINE WEDGED" : "");
+#if NATIVE_DEBUG
+        if (s->ivCpuN || s->hotN) {
+            const u64 n = s->ivCpuN ? s->ivCpuN : 1, h = s->hotN ? s->hotN : 1, l = s->hotLines ? s->hotLines : 1;
+            LOG("native: CPU route per frame: convert %lu us (the thread ran %lu us of it), flush %lu us | "
+                "last piece again, in the cache (%u lines, %u times): tiled %lu us, row order %lu us, read only %lu us "
+                "-> a whole frame at that speed: tiled %lu us, row order %lu us | CPU clock %u MHz, tiled lines zeroed first: %s\n",
+                s->ivConvNs / n / 1000, s->ivConvRunNs / n / 1000, s->ivFlushNs / n / 1000,
+                s->hotLines, s->hotN, s->hotBl / h / 1000, s->hotPitch / h / 1000, s->hotRead / h / 1000,
+                s->hotBl / h * VIC_OUT_H / l / 1000, s->hotPitch / h * VIC_OUT_H / l / 1000,
+                NvencPcvClockHz(0x40000001u) / 1000000, CpuUsesZva() ? "yes" : "no");
+        }
+        s->ivConvNs = s->ivConvRunNs = s->ivFlushNs = 0;
+        s->hotBl = s->hotPitch = s->hotRead = 0;
+        s->hotN = 0;
+#endif
         s->ivVicJobs = s->ivCpuN = s->ivCpuUnsup = 0;
         s->ivCpuNs = s->ivCpuMax = 0;
         if (NvencActive() || NvencWedged()) {
@@ -1610,6 +1705,13 @@ void NativeCaptureThread(void* arg)
         }
         if (s->attached && s->locked && NvencActive() && UvcDeviceIsStreaming())
             _probe(s);
+#if NATIVE_DEBUG
+        if (s->attached && s->mode == MODE_CPU && s->hotOk && !s->pending && UvcDeviceIsStreaming() &&
+            _nowNs() >= s->nextHot) {
+            s->nextHot = _nowNs() + 1000000000ULL;
+            _hotRerun(s);
+        }
+#endif
 
 #if NATIVE_DEBUG
         // suspended (HOME): its buffers hold still - dump the one on screen

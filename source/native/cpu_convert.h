@@ -19,5 +19,8 @@ bool CpuConvertNv12(const u8* slot, const VicSource* src, u8* y, u8* uv, bool bl
 // layout read on its own (CpuBlockRowLines lines; rows outside data must not
 // be asked for). y/uv are the whole output planes.
 u32  CpuBlockRowLines(const VicSource* src);
+// Whether the tiled output zeroes its lines (DC ZVA) instead of reading them
+// from memory before writing.
+bool CpuUsesZva(void);
 bool CpuConvertRows(const u8* data, u64 dataOff, const VicSource* src, u32 rowFirst, u32 rowEnd,
                     u8* y, u8* uv, bool blockLinear);

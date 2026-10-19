@@ -77,12 +77,114 @@ u32 CpuBlockRowLines(const VicSource* src)
     return 8u << src->blk_h_log2;
 }
 
+// DC ZVA: a whole cache line zeroed without reading it from memory first.
+// The tiled output is written in full lines (below), so zeroing each line
+// before its first write saves the line fill a plain store costs - from
+// memory a GPU-heavy game keeps busy. Used only if the CPU allows it with
+// 64-byte lines (DCZID_EL0), else plain stores.
+static int g_zva = -1;
+
+static bool _zvaOk(void)
+{
+    if (g_zva < 0) {
+        u64 id = 0;
+        __asm__ volatile("mrs %0, dczid_el0" : "=r"(id));
+        g_zva = !(id & 0x10) && (4u << (id & 0xF)) == 64;
+    }
+    return g_zva == 1;
+}
+
+bool CpuUsesZva(void) { return _zvaOk(); }
+
+static inline void _zero64(u8* p)
+{
+    __asm__ volatile("dc zva, %0" : : "r"(p) : "memory");
+}
+
+// NVENC's layout, 1280 wide (20 GOBs, 2 GOBs a block): the 16 output bytes at
+// x = gx * 16 of row r are at rowBase(r) + gobOff(gx) (+16 for an odd row).
+static inline u64 _tRow(u32 r)
+{
+    return (u64)(r >> 4) * (VIC_OUT_W / 64 * 1024) + ((r >> 3) & 1) * 512 + ((r & 7) >> 1) * 64;
+}
+
+static inline u32 _tGob(u32 gx)
+{
+    return (gx >> 2) * 1024 + ((gx & 3) >> 1) * 256 + (gx & 1) * 32;
+}
+
+// The tiled fast path: one row pair at a time. A 64-byte luma line is the row
+// pair's 32 pixels at gx and gx+1 (rows +0/+16, chunks +0/+32): zeroed at
+// even gx. A chroma line holds two chroma rows: zeroed by the first of them
+// in the order the rows are written (the top one, the bottom one if flipped).
+static inline void _rowsTiled(const u8* data, u64 dataOff, const VicSource* src, u32 rowFirst, u32 rowEnd,
+                              u8* y, u8* uv, const bool bgr, const bool zva)
+{
+    const u32 W = VIC_OUT_W, H = VIC_OUT_H;
+    const bool flipV = (src->flip & 2) != 0;
+    const u32 bh = 1u << src->blk_h_log2;
+    const u64 blockBytes = 512u * bh;
+    const u64 rowBytes = (u64)(src->stride_px * 4 / 64) * blockBytes;
+    u32 gob[VIC_OUT_W / 16];
+    for (u32 gx = 0; gx < W / 16; gx++)
+        gob[gx] = _tGob(gx);
+
+    for (u32 row = rowFirst; row < rowEnd; row += 2) {
+        const u8* base = data + ((row / (8 * bh)) * rowBytes + ((row / 8) % bh) * 512 + ((row % 8) / 2) * 64 - dataOff);
+        // output rows: the pair (e, e+1); flipped, source row `row` lands on e+1
+        const u32 e = flipV ? H - 2 - row : row;
+        const u32 dc = e / 2;
+        u8* yl = y + _tRow(e);
+        u8* cl = uv + _tRow(dc) + (dc & 1) * 16;
+        const bool zeroC = zva && (dc & 1) == (flipV ? 1u : 0u);
+        for (u32 gx = 0; gx < W / 16; gx++) {
+            const u8* g = base + gx * blockBytes;
+            uint8x16_t r0, g0, b0, r1, g1, b1;
+            _deinterleave(g, &r0, &g0, &b0);
+            _deinterleave(g + 16, &r1, &g1, &b1);
+            if (bgr) {
+                const uint8x16_t t0 = r0, t1 = r1;
+                r0 = b0; b0 = t0;
+                r1 = b1; b1 = t1;
+            }
+            u8* yo = yl + gob[gx];
+            u8* co = cl + gob[gx];
+            if (zva && !(gx & 1)) {
+                _zero64(yo);
+                if (zeroC)
+                    _zero64(co - (dc & 1) * 16);
+            }
+            const uint8x16_t ya = _luma(r0, g0, b0), yb = _luma(r1, g1, b1);
+            vst1q_u8(yo, flipV ? yb : ya);
+            vst1q_u8(yo + 16, flipV ? ya : yb);
+            const int16x8_t ar = _avg4(r0, r1), ag = _avg4(g0, g1), ab = _avg4(b0, b1);
+            uint8x8x2_t cc;
+            cc.val[0] = _chroma(ar, ag, ab, -26, -87, 113);
+            cc.val[1] = _chroma(ar, ag, ab, 112, -102, -10);
+            vst2_u8(co, cc);
+        }
+    }
+}
+
 bool CpuConvertRows(const u8* data, u64 dataOff, const VicSource* src, u32 rowFirst, u32 rowEnd,
                     u8* y, u8* uv, bool blockLinear)
 {
     const u32 W = VIC_OUT_W, H = VIC_OUT_H;
     if (!data || !CpuCanConvert(src) || (rowFirst & 1) || rowEnd > H || rowFirst > rowEnd)
         return false;
+    if (blockLinear) {
+        const bool bgr = src->pixfmt == VIC_PIXFMT_A8B8G8R8, zva = _zvaOk();
+        // each combination its own loop: no branch on them inside
+        if (bgr && zva)
+            _rowsTiled(data, dataOff, src, rowFirst, rowEnd, y, uv, true, true);
+        else if (bgr)
+            _rowsTiled(data, dataOff, src, rowFirst, rowEnd, y, uv, true, false);
+        else if (zva)
+            _rowsTiled(data, dataOff, src, rowFirst, rowEnd, y, uv, false, true);
+        else
+            _rowsTiled(data, dataOff, src, rowFirst, rowEnd, y, uv, false, false);
+        return true;
+    }
     const bool bgr = src->pixfmt == VIC_PIXFMT_A8B8G8R8;  // the game's bytes B,G,R,A (see _source)
     const bool flipV = (src->flip & 2) != 0;
     const u32 bh = 1u << src->blk_h_log2;
