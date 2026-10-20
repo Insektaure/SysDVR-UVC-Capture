@@ -31,7 +31,10 @@ static volatile u32 g_commits = 0;
 static u8 alignas(0x1000) g_videoBuffer[0x60000];       // ~384KB for video frames
 static u8 alignas(0x1000) g_controlBuffer[0x1000];     // 4KB for VS control transfers
 static u8 alignas(0x1000) g_vcControlBuffer[0x1000];   // 4KB for VC control transfers (separate from VS)
-static u8 alignas(0x1000) g_endpointInBuffer[0x4000];  // Video transfer staging buffer (must fit maxPayload + header)
+// Video transfer staging buffers: one per payload in flight (UvcDeviceSendFrame
+// keeps up to VIDEO_INFLIGHT posted; each must fit maxPayload + header)
+#define VIDEO_INFLIGHT 4
+static u8 alignas(0x1000) g_endpointInBuffers[VIDEO_INFLIGHT][0x4000];
 static u8 alignas(0x1000) g_audioEndpointBuffer[0x1000]; // Audio transfer staging buffer
 
 static UvcDeviceContext g_uvcCtx;
@@ -958,6 +961,92 @@ Result UvcDeviceWaitReady(u64 timeout)
     return usbDsWaitReady(timeout);
 }
 
+// The video transfers in flight, oldest first (UvcDeviceSendFrame)
+// (a payload and its ZLP each count; slot: the staging buffer it reads)
+typedef struct { u32 urb[VIDEO_INFLIGHT * 2]; u8 slot[VIDEO_INFLIGHT * 2]; u32 n; } VideoInflight;
+
+static void _inflightPop(VideoInflight* q, u32 k)
+{
+    for (u32 i = k; i < q->n; i++) {
+        q->urb[i - k] = q->urb[i];
+        q->slot[i - k] = q->slot[i];
+    }
+    q->n -= k;
+}
+
+// One report's news about the transfers in flight: returns how many of the
+// oldest are done (one done means every older one is: the endpoint completes
+// them in order, and a report holds only the last 8), or -1 if one was
+// cancelled or failed.
+static int _inflightDone(const VideoInflight* q, const UsbDsReportData* rd)
+{
+    const u32 count = rd->report_count > 8 ? 8 : rd->report_count;
+    int done = 0;
+    for (u32 i = 0; i < q->n; i++) {
+        for (u32 k = 0; k < count; k++) {
+            if (rd->report[k].id != q->urb[i])
+                continue;
+            if (rd->report[k].urb_status == 3)
+                done = (int)i + 1;
+            else if (rd->report[k].urb_status == 4 || rd->report[k].urb_status == 5)
+                return -1;
+        }
+    }
+    return done;
+}
+
+// Waits until at most `keep` transfers are in flight. False: the host did not
+// read for 1 s (or a transfer failed) - every transfer is cancelled AND reaped
+// (cancel without reaping followed by re-posting asserts usb:ds).
+static bool _inflightWait(VideoInflight* q, u32 keep)
+{
+    UsbDsReportData rd;
+    while (q->n > keep) {
+        if (R_FAILED(eventWait(&g_uvcCtx.videoEndpointIn->CompletionEvent, 1E+9)))
+            goto stalled;
+        eventClear(&g_uvcCtx.videoEndpointIn->CompletionEvent);
+        if (R_FAILED(usbDsEndpoint_GetReportData(g_uvcCtx.videoEndpointIn, &rd)))
+            goto stalled;
+        const int done = _inflightDone(q, &rd);
+        if (done < 0)
+            goto stalled;
+        _inflightPop(q, (u32)done);
+    }
+    return true;
+
+stalled:
+    // The host is not reading right now. This is NOT a reliable stop
+    // signal: OBS routinely stalls its buffer dequeuing for >1s (scene
+    // switches, render hiccups) without closing the device - declaring the
+    // stream stopped here freezes its feed permanently, because a host that
+    // never closed the device never re-issues probe/commit. So: cancel and
+    // REAP the stalled URBs, drop this frame, and STAY in STREAMING. If the
+    // host genuinely stopped (CLEAR_FEATURE(HALT) is invisible to us), this
+    // just idles at one reaped cancel per second until the next commit or
+    // disconnect.
+    usbDsEndpoint_Cancel(g_uvcCtx.videoEndpointIn);
+    for (u32 tries = 0; tries < 8 && q->n > 0; tries++) {
+        if (R_FAILED(eventWait(&g_uvcCtx.videoEndpointIn->CompletionEvent, 100E+6)))
+            break;
+        eventClear(&g_uvcCtx.videoEndpointIn->CompletionEvent);
+        if (R_FAILED(usbDsEndpoint_GetReportData(g_uvcCtx.videoEndpointIn, &rd)))
+            break;
+        // reaped: any final status, cancelled included
+        const u32 count = rd.report_count > 8 ? 8 : rd.report_count;
+        u32 last = 0;
+        for (u32 i = 0; i < q->n; i++) {
+            for (u32 k = 0; k < count; k++) {
+                if (rd.report[k].id == q->urb[i] && rd.report[k].urb_status >= 3)
+                    last = i + 1;
+            }
+        }
+        _inflightPop(q, last);
+    }
+    LOG("Video transfer timeout - dropping frame%s\n", q->n ? " (some transfers not reaped)" : "");
+    q->n = 0;
+    return false;
+}
+
 bool UvcDeviceSendFrame(const void* data, size_t size, u64 timestamp, bool isKeyframe)
 {
     if (!g_uvcCtx.initialized || g_uvcCtx.state != UVC_STATE_STREAMING) {
@@ -966,10 +1055,8 @@ bool UvcDeviceSendFrame(const void* data, size_t size, u64 timestamp, bool isKey
 
     mutexLock(&g_uvcCtx.streamingMutex);
 
-    Result rc;
     bool success = false;
-    u32 urbId;
-    UsbDsReportData reportData;
+    VideoInflight q = { {0}, {0}, 0 };
 
     // 90kHz PTS, no longer transmitted (the minimal payload header omits
     // PTS/SCR on purpose); computed only to keep the header-builder API.
@@ -984,90 +1071,67 @@ bool UvcDeviceSendFrame(const void* data, size_t size, u64 timestamp, bool isKey
     // slack is inherited from the old 12-byte header and intentionally kept.
     const size_t maxPayload = 0x4000 - 12;
 
-    while (remaining > 0) {
+    // Up to VIDEO_INFLIGHT payloads posted at once, each in its own buffer:
+    // waiting for each 16 KB before posting the next left the link idle in
+    // between (~0.75 ms a payload, ~21 MB/s). A buffer is reused only once
+    // its transfer is done (at most VIDEO_INFLIGHT - 1 left in flight).
+    eventClear(&g_uvcCtx.videoEndpointIn->CompletionEvent);  // drop stale signal
+    u32 slot = 0;
+    bool ok = true;
+    while (remaining > 0 && ok) {
         size_t chunkSize = remaining > maxPayload ? maxPayload : remaining;
         bool isLastChunk = (remaining <= maxPayload);
 
-        u8* dest = g_endpointInBuffer;
+        // the staging buffer to reuse: wait until no transfer reads it any
+        // more (round robin and in order: those are the oldest in flight)
+        u32 busy = 0;
+        for (u32 i = 0; i < q.n; i++) {
+            if (q.slot[i] == slot)
+                busy = i + 1;
+        }
+        if (busy && !_inflightWait(&q, q.n - busy)) {
+            ok = false;
+            break;
+        }
+        u8* dest = g_endpointInBuffers[slot];
         u8 headerLen = UvcBuildPayloadHeader(dest, pts, isLastChunk, g_uvcCtx.frameId);
 
         memcpy(dest + headerLen, srcData, chunkSize);
 
         size_t totalSize = headerLen + chunkSize;
 
-        eventClear(&g_uvcCtx.videoEndpointIn->CompletionEvent);  // drop stale signal
-        rc = usbDsEndpoint_PostBufferAsync(g_uvcCtx.videoEndpointIn, dest, totalSize, &urbId);
+        u32 urbId;
+        Result rc = usbDsEndpoint_PostBufferAsync(g_uvcCtx.videoEndpointIn, dest, totalSize, &urbId);
         if (R_FAILED(rc)) {
             LOG("PostBufferAsync failed: 0x%x\n", rc);
+            ok = false;
             break;
         }
-
-        rc = eventWait(&g_uvcCtx.videoEndpointIn->CompletionEvent, 1E+9);
-        if (R_FAILED(rc)) {
-            // The host is not reading right now. This is NOT a reliable stop
-            // signal: OBS routinely stalls its buffer dequeuing for >1s
-            // (scene switches, render hiccups) without closing the device -
-            // declaring the stream stopped here freezes its feed permanently,
-            // because a host that never closed the device never re-issues
-            // probe/commit. So: cancel and REAP the stalled URB (cancel
-            // without reaping followed by re-posting asserts usb:ds), drop
-            // this frame, and STAY in STREAMING. If the host genuinely
-            // stopped (CLEAR_FEATURE(HALT) is invisible to us), this just
-            // idles at one reaped cancel per second until the next commit
-            // or disconnect.
-            usbDsEndpoint_Cancel(g_uvcCtx.videoEndpointIn);
-            if (R_SUCCEEDED(eventWait(&g_uvcCtx.videoEndpointIn->CompletionEvent, 100E+6))) {
-                eventClear(&g_uvcCtx.videoEndpointIn->CompletionEvent);
-                usbDsEndpoint_GetReportData(g_uvcCtx.videoEndpointIn, &reportData);
-            }
-            LOG("Video transfer timeout - dropping frame\n");
-            break;
-        }
-        eventClear(&g_uvcCtx.videoEndpointIn->CompletionEvent);
-
-        rc = usbDsEndpoint_GetReportData(g_uvcCtx.videoEndpointIn, &reportData);
-        if (R_FAILED(rc)) {
-            LOG("GetReportData failed: 0x%x\n", rc);
-            break;
-        }
-
-        u32 transferred;
-        rc = usbDsParseReportData(&reportData, urbId, NULL, &transferred);
-        if (R_FAILED(rc)) {
-            LOG("ParseReportData failed: 0x%x\n", rc);
-            break;
-        }
+        q.slot[q.n] = (u8)slot;
+        q.urb[q.n++] = urbId;
 
         // A payload that is an exact multiple of the bulk packet size (512
         // at high speed) produces no short packet, so the host cannot see
         // the payload boundary and fuses it with the next payload - random
-        // corrupted frames (~1 in 512 frames). Terminate it with a ZLP.
+        // corrupted frames (~1 in 512 frames). Terminate it with a ZLP,
+        // queued right behind it.
         if ((totalSize % 512) == 0) {
             u32 zlpUrbId;
-            eventClear(&g_uvcCtx.videoEndpointIn->CompletionEvent);
-            if (R_SUCCEEDED(usbDsEndpoint_PostBufferAsync(
-                    g_uvcCtx.videoEndpointIn, dest, 0, &zlpUrbId))) {
-                if (R_SUCCEEDED(eventWait(&g_uvcCtx.videoEndpointIn->CompletionEvent, 1E+9))) {
-                    eventClear(&g_uvcCtx.videoEndpointIn->CompletionEvent);
-                    usbDsEndpoint_GetReportData(g_uvcCtx.videoEndpointIn, &reportData);
-                } else {
-                    usbDsEndpoint_Cancel(g_uvcCtx.videoEndpointIn);
-                    if (R_SUCCEEDED(eventWait(&g_uvcCtx.videoEndpointIn->CompletionEvent, 100E+6))) {
-                        eventClear(&g_uvcCtx.videoEndpointIn->CompletionEvent);
-                        usbDsEndpoint_GetReportData(g_uvcCtx.videoEndpointIn, &reportData);
-                    }
-                    break;
-                }
+            if (R_SUCCEEDED(usbDsEndpoint_PostBufferAsync(g_uvcCtx.videoEndpointIn, dest, 0, &zlpUrbId))) {
+                q.slot[q.n] = (u8)slot;
+                q.urb[q.n++] = zlpUrbId;
             }
         }
+        slot = (slot + 1) % VIDEO_INFLIGHT;
 
         srcData += chunkSize;
         remaining -= chunkSize;
-
-        if (isLastChunk) {
-            success = true;
-        }
     }
+    // whatever happened, nothing may stay in flight (a failed post leaves
+    // the earlier payloads posted): all done, or cancelled and reaped
+    if (q.n && !_inflightWait(&q, 0))
+        ok = false;
+    success = ok;
 
     // Toggle the frame ID even when the frame was aborted mid-way: an
     // aborted frame never got its EOF, and re-using the same FID makes the
@@ -1266,7 +1330,7 @@ static void _handleVsSetup(UsbDsInterface* iface, const UsbSetupPacket* setup)
         host.bFormatIndex = 1;
         host.bFrameIndex = 1;
         host.dwMaxVideoFrameSize = UVC_STREAM_MAX_FRAME_SIZE;
-        host.dwMaxPayloadTransferSize = 0x4000;  // matches g_endpointInBuffer
+        host.dwMaxPayloadTransferSize = 0x4000;  // matches g_endpointInBuffers
         host.dwClockFrequency = UVC_CLOCK_FREQUENCY;
         if (host.dwFrameInterval == 0)
             host.dwFrameInterval = UVC_STREAM_FRAME_INTERVAL;

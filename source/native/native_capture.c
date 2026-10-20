@@ -185,6 +185,9 @@ typedef struct {
     bool   needKey;          // a send failed: the host lost a frame, restart the chain
     u32    sent, sendFails, ivSent;
     u64    ivSentBytes;
+    // a frame's whole work from its read to its hand-over to the send
+    u64    ivWorkNs, jobStartNs;
+    u32    ivSendPieces, ivWorkN;
     FsFile h264;
     bool   h264Open;
     u64    h264Off;
@@ -206,14 +209,144 @@ static u64 g_retryAtNs = 0, g_retryDelayNs = 0;
 #define FILLER_NS 200000000ULL
 static u8 g_black[0x8000];
 static u32 g_blackLen = 0;
+static u64 _nowNs(void) { return armTicksToNs(armGetSystemTick()); }
+
 static u64 g_lastSentNs = 0;
 static u32 g_fillers = 0;
+
+// Background send: the capture loop hands an encoded frame to this thread and
+// goes on with the next one while USB carries it (2.2-4.3 ms a frame measured
+// in 01003ec027cc8000, the loop waiting on every 16 KB). One frame at a time,
+// copied into donor memory (set per session, _sendSetBuffer): the encoder
+// reuses its own buffer at the next encode. Without that buffer, or for a
+// frame larger than it, the frame is sent in place, as before. A failure is
+// only known at the next hand-over: that frame is already encoded, so the
+// keyframe the host needs comes one frame later than with a send in place.
+#define SEND_PRIORITY 0x3A  // above the capture loop's 0x3B: it mostly waits for USB, posting needs little
+static struct {
+    Mutex lock;
+    CondVar go, idle;
+    Thread thread;
+    bool up, quit, busy;
+    u8* buf;
+    u32 cap, len;
+    u64 tsMs;
+    bool idr;
+    u32 failed;               // failures not yet told to the capture loop
+    u64 ns, nsMax, waitNs;    // since the last periodic line: send time, and the loop's wait for the thread
+    u32 n;
+} g_send;
+static u8 alignas(0x1000) g_sendStack[0x4000];
+
+static void _sendThread(void* arg)
+{
+    (void)arg;
+    mutexLock(&g_send.lock);
+    for (;;) {
+        while (!g_send.busy && !g_send.quit)
+            condvarWait(&g_send.go, &g_send.lock);
+        if (!g_send.busy)
+            break;  // quit, nothing left to send
+        const u8* d = g_send.buf;
+        const u32 len = g_send.len;
+        const u64 ts = g_send.tsMs;
+        const bool idr = g_send.idr;
+        mutexUnlock(&g_send.lock);
+        const u64 t0 = _nowNs();
+        const bool ok = UvcDeviceSendFrame(d, len, ts, idr);
+        const u64 dt = _nowNs() - t0;
+        mutexLock(&g_send.lock);
+        g_send.ns += dt;
+        if (dt > g_send.nsMax)
+            g_send.nsMax = dt;
+        g_send.n++;
+        if (!ok)
+            g_send.failed++;
+        g_send.busy = false;
+        condvarWakeAll(&g_send.idle);
+    }
+    mutexUnlock(&g_send.lock);
+}
+
+static void _sendStart(void)
+{
+    mutexInit(&g_send.lock);
+    condvarInit(&g_send.go);
+    condvarInit(&g_send.idle);
+    if (R_SUCCEEDED(threadCreate(&g_send.thread, _sendThread, NULL, g_sendStack, sizeof(g_sendStack), SEND_PRIORITY, -2)) &&
+        R_SUCCEEDED(threadStart(&g_send.thread)))
+        g_send.up = true;
+    else
+        LOG("native: no send thread - frames are sent in the capture loop\n");
+}
+
+static void _sendStop(void)
+{
+    if (!g_send.up)
+        return;
+    mutexLock(&g_send.lock);
+    g_send.quit = true;
+    condvarWakeAll(&g_send.go);
+    mutexUnlock(&g_send.lock);
+    threadWaitForExit(&g_send.thread);
+    threadClose(&g_send.thread);
+    g_send.up = false;
+}
+
+// Waits for the frame going out, if any (lock held)
+static void _sendWaitIdle(void)
+{
+    const u64 w0 = _nowNs();
+    while (g_send.busy)
+        condvarWait(&g_send.idle, &g_send.lock);
+    g_send.waitNs += _nowNs() - w0;
+}
+
+// The donor memory the frames are copied to (NULL: none - before it goes)
+static void _sendSetBuffer(u8* buf, u32 cap)
+{
+    mutexLock(&g_send.lock);
+    _sendWaitIdle();
+    g_send.buf = buf;
+    g_send.cap = cap;
+    mutexUnlock(&g_send.lock);
+}
+
+// A frame to the camera. False: it failed (sent in place), or an earlier one
+// did (sent in the background) - the host lost a frame, the chain restarts.
+static bool _send(const u8* data, u32 len, u64 tsMs, bool idr)
+{
+    mutexLock(&g_send.lock);
+    _sendWaitIdle();  // in order: the one going out first
+    const bool earlierFailed = g_send.failed != 0;
+    g_send.failed = 0;
+    if (!g_send.up || !g_send.buf || len > g_send.cap) {
+        mutexUnlock(&g_send.lock);
+        const u64 t0 = _nowNs();
+        const bool ok = UvcDeviceSendFrame(data, len, tsMs, idr);
+        const u64 dt = _nowNs() - t0;
+        mutexLock(&g_send.lock);
+        g_send.ns += dt;
+        if (dt > g_send.nsMax)
+            g_send.nsMax = dt;
+        g_send.n++;
+        mutexUnlock(&g_send.lock);
+        return ok && !earlierFailed;
+    }
+    memcpy(g_send.buf, data, len);
+    g_send.len = len;
+    g_send.tsMs = tsMs;
+    g_send.idr = idr;
+    g_send.busy = true;
+    condvarWakeOne(&g_send.go);
+    mutexUnlock(&g_send.lock);
+    return !earlierFailed;
+}
 
 // When the running application last changed: how long a game switch keeps
 // the camera without frames (logged with the first frame of a session)
 static u64 g_appPid = 0, g_appSinceNs = 0;
 
-static u64 _nowNs(void) { return armTicksToNs(armGetSystemTick()); }
 
 // ============================================================================
 // SD card
@@ -422,11 +555,23 @@ static void _takeMemory(Session* s)
     // the second slot copy, for pipelining, after the encoder's frame buffer
     const u64 copyOff = (frameOff + NvencFrameBufferSize() + 0xFFFF) & ~0xFFFFULL;
     const u64 copySize = ((u64)s->surf.buf_size + 0xFFF) & ~0xFFFULL;
-    if (copyOff + copySize <= s->memSize && VicEngineAddSlotCopy(m8 + copyOff, copySize))
+    const bool copy2 = copyOff + copySize <= s->memSize && VicEngineAddSlotCopy(m8 + copyOff, copySize);
+    if (copy2)
         LOG("native: second slot copy (%lu KB): pipelining possible, tried once streaming\n", copySize / 1024);
     else
         LOG("native: no second slot copy (%lu MB of donor memory, needs %lu) - copy and conversion one after the other\n",
             s->memSize >> 20, (copyOff + copySize + 0xFFFFF) >> 20);
+
+    // the background send's copy of a frame, after the rest; frames larger
+    // than what is left are sent in place
+    const u64 sendOff = ((copy2 ? copyOff + copySize : copyOff) + 0xFFFF) & ~0xFFFFULL;
+    if (sendOff < s->memSize && s->memSize - sendOff >= 0x40000) {
+        const u64 cap = s->memSize - sendOff < NvencFrameBufferSize() ? s->memSize - sendOff : NvencFrameBufferSize();
+        _sendSetBuffer(m8 + sendOff, (u32)cap);
+        LOG("native: frames sent in the background (copy buffer %lu KB)\n", cap / 1024);
+    } else {
+        LOG("native: no room for the background send's buffer - frames sent in the capture loop\n");
+    }
 }
 
 // The first H264_DUMP_FRAMES encoded frames of a session, as an Annex-B
@@ -480,6 +625,7 @@ static void _releaseMemory(Session* s)
         return;
     _finish(s);  // never a job in flight on memory that goes
     _probeDrain(s);
+    _sendSetBuffer(NULL, 0);  // the frame going out from it first
     GameDbgSetBounce(NULL, 0);
     NvencClose();
     VicEngineClose();
@@ -830,7 +976,13 @@ static void _finish(Session* s)
         _ema(&s->ePipe, s->jobPipeNs + encNs, 3);
     s->needKey = false;
     _h264Append(s, frame, len);
-    if (UvcDeviceSendFrame(frame, len, armTicksToNs(p->tick) / 1000000, idr)) {
+    const bool sentOk = _send(frame, len, armTicksToNs(p->tick) / 1000000, idr);
+    s->ivSendPieces += (len + 0x4000 - 12 - 1) / (0x4000 - 12);  // UvcDeviceSendFrame's payload size
+    if (!s->pipe && s->jobStartNs) {  // pipelined frames overlap: not one frame's work
+        s->ivWorkNs += _nowNs() - s->jobStartNs;
+        s->ivWorkN++;
+    }
+    if (sentOk) {
         g_lastSentNs = _nowNs();
         if (s->sent == 0) {
             const u64 now = _nowNs();
@@ -857,6 +1009,7 @@ static bool _convert(Session* s, const UvcTapPresent* p)
 {
     if (!NvencActive())
         return false;
+    s->jobStartNs = s->pending ? 0 : _nowNs();  // (pipelined: the job in flight is older)
     if (s->pending && !VicEngineSlotCopy(s->jobCopy ^ 1))
         _finish(s);
     if (s->pending)
@@ -1482,11 +1635,21 @@ static void _logPeriodic(Session* s, const UvcTapPresent* p)
             NvencGetStats(&es, true);
             const u64 ne = es.frames ? es.frames : 1;
             const u64 bits = (es.bytesI + es.bytesP) * 8;
+            const u64 ns = s->ivSent ? s->ivSent : 1, nw = s->ivWorkN ? s->ivWorkN : 1;
             LOG("native: USB last 10 s: %u frames sent (%lu KB), %u send failures in total, %u sent in total; "
-                "copies re-read %u, torn and skipped %u; keep-alive frames %u\n",
-                s->ivSent, s->ivSentBytes / 1024, s->sendFails, s->sent, s->rereads, s->torn, g_fillers);
+                "copies re-read %u, torn and skipped %u; keep-alive frames %u | send avg %lu us (max %lu), "
+                "%lu.%lu pieces of 16 KB a frame | a frame's work, read to handed over: avg %lu us, waited for the send thread avg %lu us\n",
+                s->ivSent, s->ivSentBytes / 1024, s->sendFails, s->sent, s->rereads, s->torn, g_fillers,
+                g_send.n ? g_send.ns / g_send.n / 1000 : 0, g_send.nsMax / 1000, (u64)s->ivSendPieces / ns,
+                (u64)s->ivSendPieces * 10 / ns % 10, s->ivWorkNs / nw / 1000, g_send.waitNs / ns / 1000);
+            mutexLock(&g_send.lock);
+            g_send.ns = g_send.nsMax = g_send.waitNs = 0;
+            g_send.n = 0;
+            mutexUnlock(&g_send.lock);
             s->ivSent = 0;
             s->ivSentBytes = 0;
+            s->ivWorkNs = 0;
+            s->ivSendPieces = s->ivWorkN = 0;
             LOG("native: NVENC last 10 s: %u frames (%u.%u fps), %u keyframes, encode avg %lu us (max %lu), "
                 "%lu Mbps (I avg %lu KB, P avg %lu KB), errors %u, clock %u MHz%s\n",
                 es.frames, es.frames / 10, es.frames % 10, es.idrs, es.nsTotal / ne / 1000, es.nsMax / 1000,
@@ -1542,7 +1705,7 @@ static void _filler(Session* s)
         return;
     }
     g_lastSentNs = _nowNs();  // even if it fails: a stalled host is not retried at once
-    if (UvcDeviceSendFrame(frame, len, g_lastSentNs / 1000000, idr))
+    if (_send(frame, len, g_lastSentNs / 1000000, idr))
         g_fillers++;
     else
         s->needKey = true;
@@ -1552,6 +1715,7 @@ void NativeCaptureThread(void* arg)
 {
     (void)arg;
     LOG("native: capture started (native H.264 720p to the camera while an app streams)\n");
+    _sendStart();
     DonorCleanupStale();
     Session* s = &g_s;
     memset(s, 0, sizeof(*s));
@@ -1744,6 +1908,7 @@ void NativeCaptureThread(void* arg)
     }
 
     _endSession(s, "probe stopping");
+    _sendStop();
     TapClientClose();
     LOG("native: probe exiting\n");
 }

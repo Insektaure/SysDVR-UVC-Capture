@@ -584,6 +584,19 @@ DCZID_EL0) and offsets computed once per row pair saved ~0.3-0.5 ms (7.9 ->
 7.4-7.6 ms of CPU time). The remaining lever is the ~6 ms of preemption
 (raising the thread's priority during the conversion - not done: it would
 delay core 3's services, input and audio among them, by up to ~8 ms a frame).
+USB send: measured at 2.2-4.3 ms a frame in game 3 (2.8-5.7 payloads of
+16 KB, ~0.75 ms each: every payload was waited on before the next was
+posted, ~21 MB/s), all of it time the capture loop waited. Now (1) a send
+thread takes each encoded frame - copied into donor memory after the second
+slot copy, ~1.5 MB - and the loop goes on with the next frame; a send failure
+is known at the next hand-over, so the keyframe the host needs comes one frame
+later than before; (2) UvcDeviceSendFrame keeps up to 4 payloads in flight,
+each in its own staging buffer, a ZLP still right behind a payload that is a
+multiple of 512 bytes. usb:ds reports at most the last 8 transfers, with
+status 3 done, 4 cancelled, 5 failed, anything else pending: a transfer counts
+as done when it or a later one is reported done (the endpoint completes them
+in order); on a 1 s stall every transfer is cancelled and reaped before
+returning, as before.
 Startup: the 20 s wait
 for the system to come up only applies in the first minute after boot;
 turned on later from ovlSysmodules, SysDVR-UVC starts at once. SysDVR-UVC still
