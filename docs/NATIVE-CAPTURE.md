@@ -597,6 +597,29 @@ status 3 done, 4 cancelled, 5 failed, anything else pending: a transfer counts
 as done when it or a later one is reported done (the endpoint completes them
 in order); on a 1 s stall every transfer is cancelled and reaped before
 returning, as before.
+Encode beside the next frame: the send off the loop, the encode (~1.4-2.2
+ms) was the last engine the loop waited for. The arena now holds two NVENC
+input pictures (+1.33 MB; donor 34 MB): a frame is written (CPU or VIC) to
+one while NVENC encodes the other. NvencSubmit starts the encode and flips
+the picture; the job is polled between the pieces of the next frame and once
+a pass (the loop waits at most 1 ms for a present while an encode is in
+flight), and collected before the next submit - which is also what frees the
+picture the frame after writes. A collected frame goes to the send thread
+at once, so latency does not grow. The status-index check, the 1 s + 3 s
+late/wedged rule and the bad-frame rule are unchanged. The keep-alive's
+filler re-encodes the picture submitted last (NvencEncodeAgain). The mode
+predictions no longer count the encode.
+Delay on the Switch side (logging builds: "game present to last byte out",
+the game's present to the frame's last byte over USB). Tetris at 60 fps, A/B
+against a build encoding and sending in the loop as before: 6.5-6.7 ms on
+average before, 6.8-7.8 ms with the encode and send beside the loop (the
+loop notices a finished encode up to ~1 ms later), worst frames 18-22 vs
+27-29 ms: a finished encode waited while the loop waited on the next
+present's GPU fence. That wait now polls the encode too (_waitFence). A
+delay seen on the PC beyond these numbers is the viewer's: DirectShow's
+-rtbufsize holds up to ~2 s at Tetris's ~30 Mbps, and stays until the viewer
+restarts (toggling the sysmodule only helps because it restarts the viewer's
+device).
 Startup: the 20 s wait
 for the system to come up only applies in the first minute after boot;
 turned on later from ovlSysmodules, SysDVR-UVC starts at once. SysDVR-UVC still

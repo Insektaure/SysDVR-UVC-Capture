@@ -27,9 +27,13 @@
 #define A_REF_B     (A_SETUP_P + 0x1000)
 #define A_ME_A      (A_REF_B + 0x160000)            // motion prediction (grc: 128 KB apart)
 #define A_ME_B      (A_ME_A + 0x40000)
-#define A_SIZE      (A_ME_B + 0x40000)
+// a second picture: the next frame is written to one while NVENC reads the
+// other (the encode runs beside the next frame's read and conversion)
+#define A_CUR2      ((A_ME_B + 0x40000 + 0xFFF) & ~0xFFFu)
+#define A_SIZE      (A_CUR2 + A_LUMA + A_CHROMA)
 
 _Static_assert(A_CUR_UV % 0x100 == 0, "host1x addresses are >> 8");
+_Static_assert((A_CUR2 + A_LUMA) % 0x100 == 0, "host1x addresses are >> 8");
 _Static_assert(A_CHROMA == 1280 * 368, "16-row blocks: what NVENC reads");
 
 #define GOP          60           // a keyframe every second at 60 fps (SFT)
@@ -79,6 +83,12 @@ static u32 g_pic = PIC_INDEX0;
 static u32 g_pos = 0;                // place in the GOP; 0 = IDR next
 static bool g_needIdr = true;
 static u32 g_idrs = 0;
+static u32 g_wPic = 0;              // the picture the next frame is written to (0: A_CUR, 1: A_CUR2)
+static u32 g_lPic = 0;              // the picture submitted last (what NvencEncodeAgain encodes)
+// the job in flight (NvencSubmit .. NvencPoll)
+static bool g_job = false, g_jobP = false;
+static u32 g_jobFence = 0, g_jobPic = 0;
+static u64 g_jobT0 = 0;
 static u8* g_frame = NULL;          // SPS/PPS + one access unit: donor memory, never .bss
 static u32 g_frameSize = 0;         // (this process lives in the System pool)
 static NvencStats g_stats;
@@ -204,6 +214,8 @@ bool NvencOpen(u8* arena, u32 arenaSize, u8* frameBuf, u32 frameBufSize, u8 qp)
     g_wedged = false;
     g_needIdr = true;
     g_pos = 0;
+    g_wPic = g_lPic = 0;
+    g_job = false;
     memset(&g_stats, 0, sizeof(g_stats));
     g_a = arena;
 
@@ -259,6 +271,12 @@ bool NvencOpen(u8* arena, u32 arenaSize, u8* frameBuf, u32 frameBufSize, u8 qp)
 
 void NvencClose(void)
 {
+    if (g_job && !g_wedged) {  // never close the channel under a job
+        const u8* d = NULL;
+        u32 l = 0;
+        bool i = false;
+        NvencCollect(&d, &l, &i, NULL);
+    }
     if (!g_open) {
         _releaseClock();
         return;
@@ -278,23 +296,25 @@ void NvencClose(void)
 bool NvencActive(void) { return g_open && !g_wedged; }
 bool NvencWedged(void) { return g_wedged; }
 
+static inline u32 _picOff(u32 i) { return i ? A_CUR2 : A_CUR; }
+
 void NvencPictureCpu(u8** luma, u8** chroma, u32* lumaBytes, u32* chromaBytes)
 {
-    *luma = g_a ? g_a + A_CUR : NULL;
-    *chroma = g_a ? g_a + A_CUR_UV : NULL;
+    *luma = g_a ? g_a + _picOff(g_wPic) : NULL;
+    *chroma = g_a ? g_a + _picOff(g_wPic) + A_LUMA : NULL;
     *lumaBytes = A_LUMA;
     *chromaBytes = A_CHROMA;
 }
 
 void NvencPictureTarget(u32* lumaAddr, u32* chromaAddr)
 {
-    *lumaAddr = g_vicAddr ? g_vicAddr + A_CUR : 0;
-    *chromaAddr = g_vicAddr ? g_vicAddr + A_CUR_UV : 0;
+    *lumaAddr = g_vicAddr ? g_vicAddr + _picOff(g_wPic) : 0;
+    *chromaAddr = g_vicAddr ? g_vicAddr + _picOff(g_wPic) + A_LUMA : 0;
 }
 
 // ---- one picture -------------------------------------------------------------
 
-static u32 _buildCmd(u32* w, u32 pic, bool p)
+static u32 _buildCmd(u32* w, u32 pic, bool p, u32 cur)
 {
     u32 n = 0;
 #define M(method, value) do { w[n++] = Host1xIncr(0x10, 2); w[n++] = (method) >> 2; w[n++] = (value); } while (0)
@@ -309,8 +329,8 @@ static u32 _buildCmd(u32* w, u32 pic, bool p)
     M(NV_SET_IO_RC_PROCESS, (g_encAddr + A_RC) >> 8);
     M(NV_SET_OUT_BITSTREAM, (g_encAddr + A_BITS) >> 8);
     M(NV_SET_IOHISTORY, (g_encAddr + A_HIST) >> 8);
-    M(NV_SET_IN_CUR_PIC, (g_encAddr + A_CUR) >> 8);
-    M(NV_SET_IN_CUR_PIC_UV, (g_encAddr + A_CUR_UV) >> 8);
+    M(NV_SET_IN_CUR_PIC, (g_encAddr + cur) >> 8);
+    M(NV_SET_IN_CUR_PIC_UV, (g_encAddr + cur + A_LUMA) >> 8);
     // references alternate: this frame writes refs[pos & 1], a P frame reads
     // the previous one's; motion buffers likewise
     const u32 refOut = (g_pos & 1) ? A_REF_B : A_REF_A;
@@ -339,9 +359,9 @@ static bool _syncptReached(u32 id, u32 want)
     return (s32)(r.value - want) >= 0;
 }
 
-bool NvencEncode(bool idr, const u8** data, u32* len, bool* isIdr, u64* ns)
+static bool _submit(bool idr, u32 picIdx)
 {
-    if (!g_open || g_wedged)
+    if (!g_open || g_wedged || g_job)
         return false;
     if (idr || g_needIdr || g_pos >= GOP)
         g_pos = 0;
@@ -363,12 +383,12 @@ bool NvencEncode(bool idr, const u8** data, u32* len, bool* isIdr, u64* ns)
     armDCacheFlush(g_a + A_STATUS, 0x80);
 
     u32* cmd = (u32*)(g_a + A_CMD);
-    const u32 words = _buildCmd(cmd, pic, p);
+    const u32 words = _buildCmd(cmd, pic, p, _picOff(picIdx));
     armDCacheFlush(cmd, 0x1000);
 
     // CHANNEL_SUBMIT: the command buffer is inside the arena (handle, offset)
     u32 sb[13] = { 1, 0, 1, 1, g_ah, A_CMD, words, g_esyncpt, 1, 0, 0, 0, 0 };
-    const u64 t0 = armTicksToNs(armGetSystemTick());
+    g_jobT0 = armTicksToNs(armGetSystemTick());
     u32 nverr = 0;
     Result rc = NvdrvIoctl(g_efd, NV_IOWR(0x00, 0x01, sizeof(sb)), sb, sizeof(sb), &nverr);
     if (R_FAILED(rc) || nverr) {
@@ -377,39 +397,54 @@ bool NvencEncode(bool idr, const u8** data, u32* len, bool* isIdr, u64* ns)
         g_needIdr = true;
         return false;
     }
-    const u32 fence = sb[12];
+    g_job = true;
+    g_jobP = p;
+    g_jobFence = sb[12];
+    g_jobPic = pic;
+    return true;
+}
 
+bool NvencSubmit(bool idr)
+{
+    if (!_submit(idr, g_wPic))
+        return false;
+    g_lPic = g_wPic;
+    g_wPic ^= 1;  // the next frame goes to the other picture
+    return true;
+}
+
+bool NvencJobPending(void) { return g_job; }
+
+int NvencPoll(const u8** data, u32* len, bool* isIdr, u64* ns)
+{
+    if (!g_job)
+        return -1;
     // done = the syncpoint passed the fence AND the status carries our index
-    bool fenceDone = false, ours = false;
-    for (;;) {
-        if (!fenceDone)
-            fenceDone = _syncptReached(g_esyncpt, fence);
-        armDCacheFlush(g_a + A_STATUS, 0x80);
-        u32 pi = 0;
-        memcpy(&pi, g_a + A_STATUS + ST_PICTURE_INDEX, 4);
-        ours = pi == pic;
-        if (fenceDone && ours)
-            break;
-        if (armTicksToNs(armGetSystemTick()) - t0 > 1000000000ULL)
-            break;
-        svcSleepThread(50000);
-    }
-    const u64 dt = armTicksToNs(armGetSystemTick()) - t0;
+    bool fenceDone = _syncptReached(g_esyncpt, g_jobFence);
+    armDCacheFlush(g_a + A_STATUS, 0x80);
+    u32 pi = 0;
+    memcpy(&pi, g_a + A_STATUS + ST_PICTURE_INDEX, 4);
+    bool ours = pi == g_jobPic;
+    const u64 dt = armTicksToNs(armGetSystemTick()) - g_jobT0;
+    if (!(fenceDone && ours) && dt <= 1000000000ULL)
+        return 0;
+    g_job = false;
+    const bool p = g_jobP;
     if (!fenceDone || !ours) {
         // SFT v0.7.1: late is not wedged - give it 3 s more before saying so
         for (u32 i = 0; i < 300 && !fenceDone; i++) {
             svcSleepThread(10000000ULL);
-            fenceDone = _syncptReached(g_esyncpt, fence);
+            fenceDone = _syncptReached(g_esyncpt, g_jobFence);
         }
         g_stats.timeouts++;
         g_needIdr = true;
         if (!fenceDone) {
             g_wedged = true;
-            LOG("nvenc: job never completed (syncpoint %u, fence %u) - engine wedged, no more jobs\n", g_esyncpt, fence);
+            LOG("nvenc: job never completed (syncpoint %u, fence %u) - engine wedged, no more jobs\n", g_esyncpt, g_jobFence);
         } else {
             LOG("nvenc: job late (%s) - restarting the chain from a keyframe\n", ours ? "fence" : "no status of ours");
         }
-        return false;
+        return -1;
     }
 
     u32 errWord = 0, bits = 0, start = 0;
@@ -424,7 +459,7 @@ bool NvencEncode(bool idr, const u8** data, u32* len, bool* isIdr, u64* ns)
         g_stats.errors++;
         g_needIdr = true;  // never predict from a frame we did not keep
         LOG("nvenc: bad frame (ucode 0x%x, %u bytes, start %u) - next is a keyframe\n", errWord >> 2, bytes, start);
-        return false;
+        return -1;
     }
     armDCacheFlush(g_a + A_BITS, bytes);  // the engine wrote it: drop stale lines
     memcpy(g_frame, NvencSpsPps720, hdrs);
@@ -448,7 +483,20 @@ bool NvencEncode(bool idr, const u8** data, u32* len, bool* isIdr, u64* ns)
     *len = (u32)(hdrs + bytes);
     if (ns)
         *ns = dt;
-    return true;
+    return 1;
+}
+
+int NvencCollect(const u8** data, u32* len, bool* isIdr, u64* ns)
+{
+    int r;
+    while ((r = NvencPoll(data, len, isIdr, ns)) == 0)
+        svcSleepThread(50000);
+    return r;
+}
+
+bool NvencEncodeAgain(const u8** data, u32* len, bool* isIdr, u64* ns)
+{
+    return _submit(false, g_lPic) && NvencCollect(data, len, isIdr, ns) > 0;
 }
 
 bool NvencEncodeBlack(u8* out, u32 max, u32* len)
@@ -457,13 +505,16 @@ bool NvencEncodeBlack(u8* out, u32 max, u32* len)
         return false;
     // a uniform picture needs no layout: block-linear or not, every byte is
     // the same value per plane
-    memset(g_a + A_CUR, 16, A_LUMA);
-    memset(g_a + A_CUR_UV, 128, A_CHROMA);
-    armDCacheFlush(g_a + A_CUR, A_CUR_UV + A_CHROMA - A_CUR);
+    if (g_job)
+        return false;
+    u8* pic = g_a + _picOff(g_wPic);
+    memset(pic, 16, A_LUMA);
+    memset(pic + A_LUMA, 128, A_CHROMA);
+    armDCacheFlush(pic, A_LUMA + A_CHROMA);
     const u8* data = NULL;
     u32 n = 0;
     bool idr = false;
-    const bool ok = NvencEncode(true, &data, &n, &idr, NULL) && idr && n <= max;
+    const bool ok = NvencSubmit(true) && NvencCollect(&data, &n, &idr, NULL) > 0 && idr && n <= max;
     if (ok) {
         memcpy(out, data, n);
         *len = n;
