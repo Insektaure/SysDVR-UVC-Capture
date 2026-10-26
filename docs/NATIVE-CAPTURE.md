@@ -620,6 +620,17 @@ delay seen on the PC beyond these numbers is the viewer's: DirectShow's
 -rtbufsize holds up to ~2 s at Tetris's ~30 Mbps, and stays until the viewer
 restarts (toggling the sysmodule only helps because it restarts the viewer's
 device).
+From Switch Frame Tap's commits of 22-25 October 2026 (after 1742954):
+(1) a web applet no longer stops the capture by being open, only when it
+leaves less than 96 MB beside us or grows 24 MB past the pool when our memory
+came - Super Mario 3D All-Stars keeps OfflineWeb open the whole game, so it
+never streamed; the yield check now runs every 100 ms (OfflineWeb ran out of
+memory one step after a 1 s check in SFT); (2) vi-tap also wraps
+TransactParcel (command 0, map-alias buffers), what games built before
+firmware 3.0.0 present through (Fast RMX); (3) the swapchain is also found in
+adjacent device-mapped regions that add up to the buffer set (Pokemon
+Violet's 280 MB set, split by the game); (4) the VIC enlarges a picture
+smaller than 1280x720 with its 2-tap filter (the default 1-tap is blocky).
 Startup: the 20 s wait
 for the system to come up only applies in the first minute after boot;
 turned on later from ovlSysmodules, SysDVR-UVC starts at once. SysDVR-UVC still

@@ -6,6 +6,8 @@
  *   vi:m  GetDisplayService (2) / ...WithProxyNameExchange (3)   homebrew (libnx tries vi:m first)
  *     -> IApplicationDisplayService.GetRelayService (100)
  *       -> IHOSBinderDriver.TransactParcelAuto (3)               queueBuffer, setPreallocatedBuffer
+ *                           TransactParcel (0)                   the same, from games built before
+ *                                                                firmware 3.0.0 (map-alias buffers)
  *
  * Layout and rules from Switch Frame Tap's applet_mitm_service.hpp (GPL-2.0):
  *  - OpenLayer is NOT declared: declaring it made games fail to launch.
@@ -21,6 +23,7 @@
 #include <stratosphere.hpp>
 
 #define VITAP_BINDER_INTERFACE_INFO(C, H) \
+    AMS_SF_METHOD_INFO(C, H, 0, Result, TransactParcel, (s32 session_id, u32 code, u32 flags, const sf::InBuffer &parcel_in, const sf::OutBuffer &parcel_out), (session_id, code, flags, parcel_in, parcel_out)) \
     AMS_SF_METHOD_INFO(C, H, 3, Result, TransactParcelAuto, (s32 session_id, u32 code, u32 flags, const sf::InAutoSelectBuffer &parcel_in, const sf::OutAutoSelectBuffer &parcel_out), (session_id, code, flags, parcel_in, parcel_out))
 
 AMS_SF_DEFINE_MITM_INTERFACE(ams::vitap, IBinderMitm, VITAP_BINDER_INTERFACE_INFO, 0x56544201)
@@ -49,6 +52,7 @@ namespace ams::vitap {
             using MitmServiceImplBase::MitmServiceImplBase;
             static bool ShouldMitm(const sm::MitmProcessInfo &) { return true; }
         public:
+            Result TransactParcel(s32 session_id, u32 code, u32 flags, const sf::InBuffer &parcel_in, const sf::OutBuffer &parcel_out);
             Result TransactParcelAuto(s32 session_id, u32 code, u32 flags, const sf::InAutoSelectBuffer &parcel_in, const sf::OutAutoSelectBuffer &parcel_out);
     };
     static_assert(IsIBinderMitm<BinderMitm>);

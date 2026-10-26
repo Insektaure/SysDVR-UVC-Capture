@@ -12,6 +12,7 @@ namespace ams::vitap {
 
     struct Counters {
         std::atomic<u64> displays{0}, binders{0}, presents{0}, parse_failures{0}, other_presents{0};
+        std::atomic<u64> transact_parcel{0};   /* command 0: games built before firmware 3.0.0 */
     };
     extern Counters g_counters;
 

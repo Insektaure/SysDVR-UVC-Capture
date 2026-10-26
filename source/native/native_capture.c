@@ -77,6 +77,8 @@ static const char* const kModeName[MODES] = { "VIC", "VIC pipelined", "CPU" };
 #define PROBE_EVERY_NS    3000000000ULL
 #define PROBE_STALE_NS    30000000000ULL  // a probe older than this no longer counts
 #define PROBE_KEEP        5            // a probed cost: the median of the last ones still fresh
+#define PROBE_SLOW_NS     100000000ULL  // a CPU probe costing more a frame: the next one waits twice as long
+#define PROBE_MAX_GAP_NS  30000000000ULL
 #define H264_DUMP_FRAMES  0            // 3a wrote the first N frames to <program>.h264; off while streaming (SD writes cost latency)
 
 extern volatile bool g_nativeCaptureRunning;
@@ -164,7 +166,7 @@ typedef struct {
     u32    vicPn, cpuPn;
     u64    jobPipeNs;        // the pipelined job's read and VIC wait
     bool   probing;          // a VIC probe in flight
-    u64    nextProbe;
+    u64    nextProbe, cpuProbeGap;
     u32    ivProbes;
     u64    ivProbeNs;
     // the 2 s windows
@@ -225,7 +227,7 @@ static u32 g_fillers = 0;
 // frame larger than it, the frame is sent in place, as before. A failure is
 // only known at the next hand-over: that frame is already encoded, so the
 // keyframe the host needs comes one frame later than with a send in place.
-#define SEND_PRIORITY 0x3A  // above the capture loop's 0x3B: it mostly waits for USB, posting needs little
+#define SEND_PRIORITY 0x2C  // as the main thread: it mostly waits for USB, and a busy core 3 must not delay its posts
 static struct {
     Mutex lock;
     CondVar go, idle;
@@ -418,21 +420,54 @@ static bool _deviceMapped(const MemoryInfo* mi)
 
 // One object holding every slot (MK8): a device-mapped region of exactly the
 // set's size is the swapchain, slots at their offsets - nothing to match.
-static bool _findExact(Session* s, u64* base)
+// Or adjacent device-mapped regions adding up to it (a game splitting its
+// mapping), else the smallest larger run when no single region could hold it.
+static bool _findExact(Session* s, u64* base, u32* parts)
 {
-    u64 addr = 0;
+    u64 addr = 0, runBase = 0, runSize = 0, exact = 0, best = 0, bestSize = ~0ULL;
+    u32 runParts = 0, exactParts = 0, bestParts = 0;
+    bool single = false;
+#define END_RUN() do { \
+        if (runParts > 1 && runSize == s->span && !exact) { exact = runBase; exactParts = runParts; } \
+        if (runParts > 1 && runSize > s->span && runSize < bestSize) { best = runBase; bestSize = runSize; bestParts = runParts; } \
+        runSize = 0; runParts = 0; \
+    } while (0)
     for (u32 steps = 0; steps < 4000; steps++) {
         MemoryInfo mi = {0};
         if (!GameDbgQuery(&s->dbg, &mi, addr) || mi.size == 0)
-            return false;
+            break;
         if (_deviceMapped(&mi) && mi.size == s->span) {
             *base = mi.addr;
+            *parts = 1;
             return true;
+        }
+        if (_deviceMapped(&mi)) {
+            single |= mi.size >= s->span;
+            if (runParts == 0 || runBase + runSize != mi.addr) {
+                END_RUN();
+                runBase = mi.addr;
+            }
+            runSize += mi.size;
+            runParts++;
+        } else {
+            END_RUN();
         }
         u64 next = mi.addr + mi.size;
         if (next <= addr)
-            return false;
+            break;
         addr = next;
+    }
+    END_RUN();
+#undef END_RUN
+    if (exact) {
+        *base = exact;
+        *parts = exactParts;
+        return true;
+    }
+    if (!single && best) {
+        *base = best;
+        *parts = bestParts;
+        return true;
     }
     return false;
 }
@@ -1023,6 +1058,19 @@ static bool _changedSinceSamples(Session* s, u64 addr, const VicSource* src, con
     return false;
 }
 
+// The VIC job, waited on while the encode in flight is still collected
+static bool _vicWait(Session* s, u64* vicNs, u64* waitNs)
+{
+    const u64 t0 = _nowNs();
+    int r;
+    while ((r = VicEngineJobPoll(vicNs)) == 0) {
+        _encCollect(s, false);
+        svcSleepThread(100000);
+    }
+    *waitNs = _nowNs() - t0;
+    return r > 0;
+}
+
 // The job in flight: collect it (a VIC job), encode its picture, send it.
 static void _finish(Session* s)
 {
@@ -1030,7 +1078,7 @@ static void _finish(Session* s)
         return;
     s->pending = false;
     u64 vicNs = 0, waitNs = 0;
-    if (!s->jobCpu && !VicEngineJobWait(&vicNs, &waitNs)) {
+    if (!s->jobCpu && !_vicWait(s, &vicNs, &waitNs)) {
         s->convFails++;
         return;
     }
@@ -1226,7 +1274,9 @@ static void _probe(Session* s)
             s->nextProbe = now + PROBE_EVERY_NS;
         return;
     }
-    s->nextProbe = now + PROBE_EVERY_NS;
+    if (!s->cpuProbeGap)
+        s->cpuProbeGap = PROBE_EVERY_NS;
+    s->nextProbe = now + s->cpuProbeGap;
     // until PROBE_KEEP fresh ones; then one as each turns stale
     if (!_cpuPossible(s) || _probesFresh(s->cpuPt, s->cpuPn) >= PROBE_KEEP)
         return;
@@ -1234,12 +1284,20 @@ static void _probe(Session* s)
     const u8* slot = VicEngineSlotCopy(s->lastSrc.copy);
     if (!out || !slot || VicEngineBounceSize() < VIC_OUT_BYTES)
         return;
+    // one block row of the frame, scaled to the whole: a busy core 3 made a
+    // whole-frame probe hold the loop for seconds
+    const u32 lines = CpuBlockRowLines(&s->lastSrc) < VIC_OUT_H ? CpuBlockRowLines(&s->lastSrc) : VIC_OUT_H;
     const u64 t0 = _nowNs();
-    if (CpuConvertNv12(slot, &s->lastSrc, out, out + VIC_OUT_LUMA, false)) {
-        s->eCpu = _probeAdd(s->cpuP, s->cpuPt, &s->cpuPn, _nowNs() - t0);
-        s->ivProbes++;
-        s->ivProbeNs += _nowNs() - t0;
-    }
+    if (!CpuConvertRows(slot, 0, &s->lastSrc, 0, lines, out, out + VIC_OUT_LUMA, false))
+        return;
+    const u64 ns = (_nowNs() - t0) * VIC_OUT_H / lines;
+    s->eCpu = _probeAdd(s->cpuP, s->cpuPt, &s->cpuPn, ns);
+    s->ivProbes++;
+    s->ivProbeNs += ns;
+    // slow: the core is busy - probe less often
+    s->cpuProbeGap = ns > PROBE_SLOW_NS ? (s->cpuProbeGap * 2 > PROBE_MAX_GAP_NS ? PROBE_MAX_GAP_NS : s->cpuProbeGap * 2)
+                                        : PROBE_EVERY_NS;
+    s->nextProbe = _nowNs() + s->cpuProbeGap;
 }
 
 // Every 2 s while frames go to the camera: the window's share of the game's
@@ -1412,15 +1470,18 @@ static bool _startSession(Session* s, const UvcTapPresent* p, const UvcTapSurfac
     }
 
     u64 base = 0;
-    if (!s->separate && _findExact(s, &base)) {
+    u32 parts = 0;
+    if (!s->separate && _findExact(s, &base, &parts)) {
         for (u32 k = 0; k < sf->num_slots; k++) {
             s->cand[k] = base + sf->slot_offset[k];
             s->slotCand[k] = (u8)k;
         }
         s->ncand = sf->num_slots;
         s->locked = true;
-        s->how = "exact region";
-        _logMatch(s, "from the region of the swapchain's exact size");
+        s->how = parts > 1 ? "adjacent regions" : "exact region";
+        if (parts > 1)
+            LOG("native: no single region holds the buffer set: %u adjacent device-mapped regions do\n", parts);
+        _logMatch(s, parts > 1 ? "from adjacent regions holding the swapchain" : "from the region of the swapchain's exact size");
     } else {
         s->ncand = _findCandidates(s);
         if (s->ncand < sf->num_slots) {
@@ -1965,8 +2026,9 @@ void NativeCaptureThread(void* arg)
 
         _filler(s);
 
+        // often: an applet growing beside us must not run out first
         if (s->mem && _nowNs() >= s->nextYieldCheck) {
-            s->nextYieldCheck = _nowNs() + 1000000000ULL;
+            s->nextYieldCheck = _nowNs() + 100000000ULL;
             if (DonorShouldYield()) {
                 LOG("native: an applet needs the Applet pool - giving the donor memory back\n");
                 _releaseMemory(s);

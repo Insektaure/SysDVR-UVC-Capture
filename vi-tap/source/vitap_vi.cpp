@@ -59,6 +59,14 @@ namespace ams::vitap {
 
     }
 
+    /* games built before firmware 3.0.0; counted, never logged from a handler */
+    Result BinderMitm::TransactParcel(s32 session_id, u32 code, u32 flags, const sf::InBuffer &parcel_in, const sf::OutBuffer &parcel_out) {
+        AMS_UNUSED(session_id, flags, parcel_out);
+        g_counters.transact_parcel.fetch_add(1, std::memory_order_relaxed);
+        OnBinderTransaction(m_client_info, code, parcel_in.GetPointer(), parcel_in.GetSize());
+        R_RETURN(sm::mitm::ResultShouldForwardToSession());
+    }
+
     Result BinderMitm::TransactParcelAuto(s32 session_id, u32 code, u32 flags, const sf::InAutoSelectBuffer &parcel_in, const sf::OutAutoSelectBuffer &parcel_out) {
         AMS_UNUSED(session_id, flags, parcel_out);
         /* record, then let libstratosphere forward the request untouched */

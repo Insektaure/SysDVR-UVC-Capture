@@ -253,6 +253,9 @@ static void _fillConfig(VicConfigStruct* c, const VicSource* src, bool blockLine
     s->SourceRectBottom   = (u64)(src->rect_h - 1) << 16;
     s->DestRectRight      = VIC_OUT_W - 1;
     s->DestRectBottom     = VIC_OUT_H - 1;
+    // enlarging: 2-tap filter (the default 1-tap is blocky)
+    s->FilterLengthX      = VIC_OUT_W > src->rect_w ? 1 : 0;
+    s->FilterLengthY      = VIC_OUT_H > src->rect_h ? 1 : 0;
     s->SoftClampHigh      = 1023;
 
     VicSlotSurfaceConfig* ss = &c->slotStruct[0].slotSurfaceConfig;

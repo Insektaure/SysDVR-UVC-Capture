@@ -101,12 +101,16 @@ void LogFunctionImpl(const char* fmt, ...)
     if (len <= 0) return;
 
     FsFile file;
-    if (R_SUCCEEDED(fsFsOpenFile(&g_sdCard, "/logfile.txt", FsOpenMode_Write | FsOpenMode_Append, &file))) {
-        s64 offset = 0;
-        fsFileGetSize(&file, &offset);
-        fsFileWrite(&file, offset, buf, len, FsWriteOption_Flush);
-        fsFileClose(&file);
+    if (R_FAILED(fsFsOpenFile(&g_sdCard, "/logfile.txt", FsOpenMode_Write | FsOpenMode_Append, &file))) {
+        // deleted while we run: start a new one
+        fsFsCreateFile(&g_sdCard, "/logfile.txt", 0, 0);
+        if (R_FAILED(fsFsOpenFile(&g_sdCard, "/logfile.txt", FsOpenMode_Write | FsOpenMode_Append, &file)))
+            return;
     }
+    s64 offset = 0;
+    fsFileGetSize(&file, &offset);
+    fsFileWrite(&file, offset, buf, len, FsWriteOption_Flush);
+    fsFileClose(&file);
 }
 #endif
 

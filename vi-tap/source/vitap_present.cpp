@@ -322,13 +322,14 @@ namespace ams::vitap {
                     GetLatestPresent(std::addressof(r));
                     const u64 dt = ms - last_log_ms;
                     const u64 rate10 = last_log_ms == 0 ? 0 : (presents - last_presents) * 10000 / dt;
-                    LogLine("presents %llu (%llu.%llu/s) program %016llx slot %d mask 0x%x fences %u xf 0x%x crop (%d,%d)-(%d,%d) | wrapped %llu/%llu, parse fail %llu, other %llu",
+                    LogLine("presents %llu (%llu.%llu/s) program %016llx slot %d mask 0x%x fences %u xf 0x%x crop (%d,%d)-(%d,%d) | wrapped %llu/%llu, parse fail %llu, other %llu, pre-3.0 transactions %llu",
                             static_cast<unsigned long long>(presents),
                             static_cast<unsigned long long>(rate10 / 10), static_cast<unsigned long long>(rate10 % 10),
                             static_cast<unsigned long long>(r.program_id), r.slot, r.slot_mask, r.fence_count, r.transform,
                             r.crop[0], r.crop[1], r.crop[2], r.crop[3],
                             static_cast<unsigned long long>(g_counters.displays.load()), static_cast<unsigned long long>(g_counters.binders.load()),
-                            static_cast<unsigned long long>(g_counters.parse_failures.load()), static_cast<unsigned long long>(g_counters.other_presents.load()));
+                            static_cast<unsigned long long>(g_counters.parse_failures.load()), static_cast<unsigned long long>(g_counters.other_presents.load()),
+                            static_cast<unsigned long long>(g_counters.transact_parcel.load()));
                     last_presents = presents;
                     last_log_ms = ms;
                 }
