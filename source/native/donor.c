@@ -6,8 +6,6 @@
 // After Switch Frame Tap's applet_mitm_donor.cpp (GPL-2.0, Tomas Uribe).
 
 #define APPLET_MARGIN_MB 48  // Applet pool left free beside us (SFT TightMb)
-#define WEB_ROOM_MB 96       // more room needed beside a web applet (some games keep OfflineWeb open)
-#define WEB_GROWTH_MB 24     // a web applet growing this much past our start needs the memory
 
 static Mutex g_lock;
 static bool g_mapped = false;
@@ -15,7 +13,6 @@ static TransferMemory g_tmem;
 static Handle g_nvTmem = INVALID_HANDLE;
 static u64 g_nvSize = 0;
 static u64 g_donorPid = 0;
-static u64 g_baseMb = 0;     // the Applet group's lowest since our memory came
 
 // ============================================================================
 // pm
@@ -54,13 +51,11 @@ static bool _running(u64 programId, u64* pid)
 }
 
 // The browser applets (offline web: manuals and news, the eShop, the web
-// browser, login pages) can take nearly the whole Applet pool. Firmware 22+:
-// systemWeb (0x1042) and openWeb (0x1043).
+// browser, login pages) can take nearly the whole Applet pool (SFT v0.7.14)
 static bool _webAppletRunning(void)
 {
     static const u64 web[] = { 0x010000000000100Aull, 0x010000000000100Bull, 0x010000000000100Full,
-                               0x0100000000001010ull, 0x0100000000001011ull,
-                               0x0100000000001042ull, 0x0100000000001043ull };
+                               0x0100000000001010ull, 0x0100000000001011ull };
     for (u32 i = 0; i < sizeof(web) / sizeof(web[0]); i++) {
         if (_running(web[i], NULL))
             return true;
@@ -172,11 +167,9 @@ bool DonorObtain(u32 mb, void** addr, u64* size)
 
     u64 used = 0, limit = 0;
     const bool known = DonorAppletGroupMb(&used, &limit);
-    const bool tight = known && limit - used < mb + APPLET_MARGIN_MB;
-    const bool web = !tight && (!known || limit - used < mb + APPLET_MARGIN_MB + WEB_ROOM_MB) && _webAppletRunning();
-    if (tight || web) {
+    if (_webAppletRunning() || (known && limit - used < mb + APPLET_MARGIN_MB)) {
         LOG("donor: not now - %s (Applet group %lu of %lu MB)\n",
-            tight ? "the Applet pool is nearly full" : "a web applet is open, without room beside it",
+            known && limit - used < mb + APPLET_MARGIN_MB ? "the Applet pool is nearly full" : "a web applet is open",
             used, limit);
         mutexUnlock(&g_lock);
         return false;
@@ -248,7 +241,6 @@ bool DonorObtain(u32 mb, void** addr, u64* size)
             rc = tmemMap(&g_tmem);
             if (R_SUCCEEDED(rc)) {
                 g_mapped = ok = true;
-                g_baseMb = 0;
                 g_nvTmem = nv;
                 g_nvSize = nvSize;
                 nv = INVALID_HANDLE;
@@ -325,7 +317,6 @@ void DonorRelease(void)
         }
         tmemCloseHandle(&g_tmem);
         g_mapped = false;
-        g_baseMb = 0;
         LOG("donor: memory unmapped%s\n", tries ? " (after waiting for nvservices)" : "");
     }
 
@@ -351,15 +342,10 @@ bool DonorActive(void)
     return g_mapped;
 }
 
-// The applets are only asked when the pool looks tight for one
 bool DonorShouldYield(void)
 {
     u64 used = 0, limit = 0;
-    if (!DonorAppletGroupMb(&used, &limit))
-        return _webAppletRunning();
-    if (limit - used < APPLET_MARGIN_MB)
+    if (DonorAppletGroupMb(&used, &limit) && limit - used < APPLET_MARGIN_MB)
         return true;
-    if (!g_baseMb || used < g_baseMb)
-        g_baseMb = used;
-    return (limit - used < WEB_ROOM_MB || used >= g_baseMb + WEB_GROWTH_MB) && _webAppletRunning();
+    return _webAppletRunning();
 }
