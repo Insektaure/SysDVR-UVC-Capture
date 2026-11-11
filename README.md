@@ -47,7 +47,7 @@ The choice is re-checked on the fly, without switching to try.
 
 ## Requirements
 
-- Nintendo Switch with Atmosphère **1.12.1** (vi-tap is built against its
+- Nintendo Switch with Atmosphère **1.12.2** (vi-tap is built against its
   libstratosphere; for another version rebuild it with
   `AMS_TAG=<version> tools/build-vi-tap.sh`)
 - A data-capable USB-C cable

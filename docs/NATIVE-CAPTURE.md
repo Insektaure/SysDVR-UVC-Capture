@@ -289,11 +289,15 @@ as the last resort.
   grc:d path supports HOS 5.0+. The native path inherits SFT's range; grc:d
   remains the fallback everywhere else.
 - A is built against libstratosphere and must be rebuilt per Atmosphère
-  release. B can stay on libnx. A is pinned to **Atmosphère 1.12.1**, which
+  release. B can stay on libnx. A is pinned to **Atmosphère 1.12.2** (firmware 23.5.0), which
   needs libnx newer than the 4.12.0 release (`fsStorageForBatchRead*`, libnx
   PR #741): `tools/docker/Dockerfile` adds libnx from a pinned git commit to
   `devkitpro/devkita64`. A does not call `ams::CheckApiVersion()`, so an
   older Atmosphère does not fatal at boot; whether it works there is untested.
+  A newer *firmware* does fatal at boot, though: libstratosphere aborts in
+  `hos::InitializeVersionInternal` when the firmware major.minor is beyond the
+  headers' `TargetFirmware_Max` (1.12.1 + firmware 23.5.0). Rebuild A against
+  the Atmosphère release that adds the firmware.
 - Incompatible with SFT and the original SysDVR sysmodule (vi mitm, grc:d,
   usb:ds contention).
 

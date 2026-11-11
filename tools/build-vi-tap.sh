@@ -7,12 +7,12 @@
 # - Atmosphère is cloned into external/ (gitignored) at AMS_TAG, never into
 #   your own checkout, and patched with tools/patch_libstrat.py.
 # - The toolchain is devkitpro/devkita64 plus libnx from git (tools/docker):
-#   Atmosphère 1.12.1 needs libnx APIs newer than the 4.12.0 release.
+#   Atmosphère 1.12.x needs libnx APIs newer than the 4.12.0 release.
 # - The first build compiles libstratosphere: expect 10+ minutes.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-AMS_TAG="${AMS_TAG:-1.12.1}"
+AMS_TAG="${AMS_TAG:-1.12.2}"
 AMS="$REPO/external/Atmosphere-$AMS_TAG"
 LIBNX_COMMIT="$(sed -n 's/^ARG LIBNX_COMMIT=//p' "$REPO/tools/docker/Dockerfile")"
 IMG="${DKP_IMG:-sysdvr-uvc/devkita64:${LIBNX_COMMIT:0:7}}"
